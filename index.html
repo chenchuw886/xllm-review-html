@@ -3,12 +3,49 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark" />
-    <meta http-equiv="refresh" content="0; url=./flashcomm/" />
-    <title>xLLM 特性解读</title>
-    <link rel="canonical" href="./flashcomm/" />
+    <meta name="description" content="xLLM 特性可视化解读：从原理、数据流、收益到启用方式。" />
+    <meta name="theme-color" content="#08120f" />
+    <title>xLLM Feature Review</title>
+    <link rel="stylesheet" href="./home.css" />
   </head>
   <body>
-    <p><a href="./flashcomm/">进入 FlashComm 特性解读</a></p>
+    <main>
+      <header>
+        <a class="brand" href="./" aria-label="xLLM 特性首页"><span>x</span><b>xLLM / Feature Review</b></a>
+        <a class="repo-link" href="https://github.com/chenchuw886/xllm-review-html" target="_blank" rel="noreferrer">GitHub ↗</a>
+      </header>
+
+      <section class="intro">
+        <p>ENGINEERING, VISUALIZED</p>
+        <h1>把 xLLM 的复杂特性，<br />讲成一条<strong>看得见的数据流</strong>。</h1>
+        <span>面向开发者与使用者：先理解它解决什么，再决定何时开启。</span>
+      </section>
+
+      <section class="feature-grid" aria-label="xLLM 特性列表">
+        <a class="feature-card flash-card" href="./flashcomm/">
+          <div class="feature-top"><span>01</span><em>PREFILL · COMMUNICATION</em></div>
+          <div class="feature-visual flash-visual" aria-hidden="true">
+            <i></i><i></i><i></i><i></i>
+            <b>AR → RS</b>
+            <i></i><i></i><i></i><i></i>
+          </div>
+          <h2>Flash<span>Comm</span></h2>
+          <p>让每个 TP rank，只处理自己的 token。理解长 Prefill 通信优化如何转化为 TTFT 收益。</p>
+          <div class="feature-meta"><span>−13.4% 参考 TTFT</span><b>查看特性 ↗</b></div>
+        </a>
+
+        <a class="feature-card dspark-card" href="./dspark/">
+          <div class="feature-top"><span>02</span><em>DECODE · SPECULATIVE</em></div>
+          <div class="feature-visual dspark-visual" aria-hidden="true">
+            <i>D</i><b>→</b><i>E</i><b>→</b><i>F</i><b>→</b><i>G</i><b>→</b><i>H</i><b>→</b><i>I</i>
+          </div>
+          <h2>D<span>Spark</span></h2>
+          <p>一次起草 5 个，一把交给大模型校验。看懂半自回归草稿、接受率与长输出收益。</p>
+          <div class="feature-meta"><span>−60.1% 实测 TPOT</span><b>查看特性 ↗</b></div>
+        </a>
+      </section>
+
+      <footer>Independent xLLM feature notes · Built as zero-dependency static pages</footer>
+    </main>
   </body>
 </html>
