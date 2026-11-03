@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SWA Bounded Replay｜xLLM 特性解读</title>
+    <meta
+      name="description"
+      content="SWA Bounded Replay：CED 架构下 decoder 层 prefill 只回放末尾一段 query 行。对照 DeepInfer 的无损实现，说明 xLLM 当前这版为什么是有损的，以及它的约束与风险。"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script defer src="../assets/site.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到正文</a>
+
+    <header class="topbar">
+      <div class="shell topbar-inner">
+        <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">x</span>xLLM / Feature Review</a>
+        <nav class="topnav" aria-label="特性导航">
+          <a href="../">首页</a>
+          <a href="../arch/">V4.1 架构</a>
+          <a href="../flashcomm/">FlashComm</a>
+          <a href="../dspark/">DSpark</a>
+          <a href="../dsa-cp/">DSA CP</a>
+          <a href="../swa-replay/" aria-current="page">SWA 回放</a>
+          <a href="../engram-offload/">Engram 卸载</a>
+        </nav>
+        <div class="topbar-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换配色">☾</button>
+          <a class="ghost-link" href="https://github.com/xLLM-AI/xllm" target="_blank" rel="noreferrer">xllm ↗</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero">
+        <div class="shell">
+          <p class="eyebrow">04 / Prefill 省算 · DeepSeek-V4.1</p>
+          <h1>SWA Bounded Replay：decoder 层的 prefill，只回放末尾一段</h1>
+          <p class="hero-lede">
+            <a href="../arch/#ced">CED 架构</a>说过：第 21–39 层的全局 KV 全部借自第 20 层，它们自己只需要最近 128 个 token 的滑窗。
+            既然如此，prefill 时这些层就不必把 prompt 的每一行都算一遍 —— 只回放末尾足够覆盖滑窗的一段就够。
+            这就是「prefill 激活 8B、decode 激活 16B」这句话的落地方式。
+          </p>
+          <ul class="chips">
+            <li class="chip chip-bad">精度有损</li>
+            <li class="chip chip-warn">实验特性 · 显式 opt-in</li>
+            <li class="chip chip-info">只影响 prefill，decode 不变</li>
+          </ul>
+        </div>
+      </section>
+
+      <div class="shell doc">
+        <div class="doc-main">
+          <section class="section" id="tldr">
+            <span class="section-number">01</span>
+            <h2>一句话结论与适用条件</h2>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">先说最重要的一句</span>
+              <strong>xLLM 当前这版是明确有损的。</strong>模块 docstring 第一行就写着
+              「Explicitly lossy V4.1 prefill consumer compaction」，开启时还会打一条 warning。
+              它只保证末尾那段输出有效，前缀位置的 hidden state 是近似的。
+              <strong>不要用它跑精度评测，也不要用它做需要 prefix logits 的任务。</strong>
+            </div>
+
+            <div class="summary">
+              <div>
+                <dt>解决什么问题</dt>
+                <dd>prefill 时第 21–39 层对 prompt 的每一行都算一遍，但按 CED 的结构，这些层对远处的 token 本来就不需要逐行重算。</dd>
+              </div>
+              <div>
+                <dt>做了什么</dt>
+                <dd>第 20 层写完完整的 main / index 缓存之后，第 21–39 层只保留每个请求末尾 140 行 query，其余行直接丢掉。</dd>
+              </div>
+              <div>
+                <dt>为什么是 140</dt>
+                <dd>保留的后缀必须覆盖<strong>滑窗长度 + 最大回退长度</strong>。V4.1 的 window 是 128，留 140 是在它之上加一点余量。</dd>
+              </div>
+              <div>
+                <dt>什么时候别开</dt>
+                <dd>精度评测、需要前缀 logits 的任务、模型结构不是 40 层 / source 20 / window 128 的布局（会直接报错）。</dd>
+              </div>
+            </div>
+          </section>
+
+          <section class="section wide" id="mechanism">
+            <span class="section-number">02</span>
+            <h2>机制：在第 21 层切一刀</h2>
+
+            <figure>
+              <svg viewBox="0 0 860 300" role="img" aria-label="第 0 到 20 层对全部 token 行计算并写缓存，第 21 到 39 层只在末尾 140 行上计算" class="dg">
+                <text class="dg-t" x="20" y="26">prompt 的 query 行（示意：一个请求 N 行）</text>
+
+                <text class="dg-t-sm" x="20" y="66">层 0–20</text>
+                <rect class="dg-box-accent" x="104" y="46" width="640" height="30" rx="4" />
+                <text class="dg-t" x="424" y="66" text-anchor="middle">全部 N 行照常计算</text>
+                <text class="dg-t-sm" x="756" y="66">写缓存</text>
+
+                <path class="dg-line-accent" d="M424 82 v22" />
+                <path class="dg-fill-accent" d="M424 108 l-5 -9 h10 z" />
+                <text class="dg-t-key" x="436" y="98">第 20 层写完完整的 main KV / index 缓存</text>
+
+                <text class="dg-t-sm" x="20" y="140">层 21–39</text>
+                <rect class="dg-box-dim" x="104" y="120" width="496" height="30" rx="4" />
+                <text class="dg-t-sm" x="352" y="140" text-anchor="middle">这些行被丢掉，不进 consumer 层</text>
+                <rect class="dg-box-good" x="604" y="120" width="140" height="30" rx="4" />
+                <text class="dg-t-key" x="674" y="140" text-anchor="middle">末尾 140 行</text>
+                <text class="dg-t-sm" x="756" y="140">只算这些</text>
+
+                <path class="dg-line" d="M674 156 v20" /><path class="dg-fill-line" d="M674 180 l-5 -9 h10 z" />
+                <rect class="dg-box-amber" x="534" y="186" width="280" height="44" rx="6" />
+                <text class="dg-t-sm" x="548" y="206">结果按原行号散回原位</text>
+                <text class="dg-t-sm" x="548" y="222">生成只消费最后一行，所以输出正确</text>
+
+                <rect class="dg-box-dim" x="20" y="246" width="820" height="44" rx="6" />
+                <text class="dg-t" x="36" y="266">为什么前缀是近似的</text>
+                <text class="dg-t-sm" x="36" y="284">被丢掉的行里，有一部分本应落在保留行的 SWA 可见域内。xLLM 这版没有重建这层依赖，所以只有后缀输出有效。</text>
+              </svg>
+              <figcaption>
+                第 20 层是 decoder 唯一的 Full 层，它写完缓存之后，第 21–39 层只借它的 main KV，自己只需要滑窗。
+                切点因此落在第 21 层。
+              </figcaption>
+            </figure>
+
+            <h3>实现要处理的几件事</h3>
+            <ol class="steps">
+              <li>
+                <h4>挑行</h4>
+                <p>
+                  按每个请求的 <code>seq_lens_q</code> 取末尾 <code>min(n, 140)</code> 行，拼成一个索引张量，
+                  对 <code>hidden</code> / <code>pre_mix</code> / <code>positions</code> / <code>input_ids</code> 做 <code>index_select</code>。
+                  空 DP 副本保留框架要求的那一行 dummy。
+                </p>
+              </li>
+              <li>
+                <h4>改 metadata</h4>
+                <p>
+                  <code>seq_lens_q</code> 按 140 截断，<code>max_query_len</code> 跟着取 min，
+                  <code>slot_mappings</code> 里<strong>行数等于原始行数的那些</strong>才做 index_select ——
+                  压缩过的 source 平面行数更少（比如 ratio 2），consumer 层不会改写它们。
+                </p>
+              </li>
+              <li>
+                <h4>重定基稀疏索引</h4>
+                <p>
+                  <code>topk_idxs</code> 要按每个请求丢掉的行数 <code>drop</code> 整体减去 <code>drop</code>，
+                  负值（无效槽）保持不动。<code>candidate_blocks</code> 和 <code>candidates</code> 同步压缩。
+                </p>
+              </li>
+              <li>
+                <h4>对齐 DP 副本</h4>
+                <p>
+                  <strong>所有 DP 副本必须一起进</strong>，包括空副本 —— 只缩活跃 rank 会让 MoE 的 gather 尺寸对不上。
+                  而且每个副本可能带多个请求，保留的行数不一定都是 140，所以要用 <code>dp_all_gather</code>
+                  交换各副本的实际行数，再喂给后面的 MoE。
+                </p>
+              </li>
+              <li>
+                <h4>散回原位</h4>
+                <p>
+                  最后把结果 <code>index_copy_</code> 回原来的行号，保持 executor 的输出索引不变。
+                  生成消费的是最后一行，它仍在原来的位置上。
+                </p>
+              </li>
+            </ol>
+          </section>
+
+          <section class="section wide" id="deepinfer">
+            <span class="section-number">03</span>
+            <h2>对照 DeepInfer：无损版本是怎么做的</h2>
+            <p class="section-note">DeepInfer 是 DeepSeek 自己的推理框架，它把同一个优化做成了无损的，差别值得单独看。</p>
+
+            <p>DeepInfer 的 README 把这个特性描述为：</p>
+            <blockquote>
+              <p style="font-style: italic; color: var(--muted)">
+                reduce decoder prefill work by replaying only a bounded suffix … the retained suffix must cover the
+                SWA window plus the maximum backtracking length.
+              </p>
+            </blockquote>
+            <p>
+              对应的默认 V4.1 配置是 <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code> 加
+              <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS=140</code>，并在 <code>model_runner</code> 里有一条硬断言：
+            </p>
+            <pre><code>assert window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS &lt;= DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code></pre>
+
+            <h3>关键差别：它重建了 SWA 可见域</h3>
+            <p>
+              DeepInfer 有两种截断模式，<strong>可见域完全相同</strong>，区别只在布局：
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>模式</th><th>布局</th><th>算多少</th><th>用途</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><code>mask</code></td>
+                    <td>保持 full</td>
+                    <td>全量计算，只把矩形外的可见域整行置 -1</td>
+                    <td>等价性对照基准</td>
+                  </tr>
+                  <tr>
+                    <td><code>compact</code></td>
+                    <td>真截断成 compact</td>
+                    <td>行数减少，计算量真的下降</td>
+                    <td>生产路径</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              两种模式在 C++ 侧共用同一个 <code>yoco_swa_visibility</code> 计算，所以<strong>保留区间内的 attention 数值一致</strong>。
+              边界层（<code>n_prefill_layer</code>）上把 metadata 从 full 视图切成 compact 视图，
+              <code>kv_swa_full_index_pivots</code> 换成 compact 的 pivots，consumer 层照常读，拿到的就是截断语义。
+            </p>
+            <p>
+              这正是 xLLM 这版缺的部分：xLLM 只做了「挑行 + 改长度」，<strong>没有重算保留行的 SWA 可见域</strong>，
+              所以被丢掉的行里本该被看到的那部分就真的丢了。这就是 docstring 里
+              「Missing consumer SWA dependencies make this approximate」的含义。
+            </p>
+
+            <h3>它还验证了等价性</h3>
+            <p>
+              DeepInfer 带一个 <code>examples/yoco/yoco_equiv.py</code>，分两级：
+              L1 只比较两种模式的 SWA metadata（不加载权重）；L2 跑端到端，逐位比对 logprob 与 top-K 输出。
+              加 <code>--mtp</code> 还会比对草稿头 main cache 的写入等价性。有这套脚本，才敢说「无损」。
+            </p>
+
+            <div class="callout callout-info">
+              <span class="callout-label">两边的约束是类似的</span>
+              DeepInfer 的 compact 模式要求：草稿目标层必须全在边界同一侧，且 <strong>Engram 不能出现在 consumer 层</strong>。
+              xLLM 的校验里也有同一条（<code>engram_layer_ids</code> 不得 ≥ 21）。两边遇到的是同一组结构约束。
+            </div>
+          </section>
+
+          <section class="section wide" id="enable">
+            <span class="section-number">04</span>
+            <h2>启用方式与约束</h2>
+
+            <pre><code>--enable_swa_bounded_replay=true</code></pre>
+            <p>
+              对应 <code>ModelConfig</code> 的 <code>enable_swa_bounded_replay</code>，默认 <code>false</code>，
+              代码注释写明「Lossy V4.1 prefill experiment; enabled only by explicit runtime opt-in」。
+            </p>
+
+            <h3>启动期校验：不满足就拒绝加载</h3>
+            <p><code>validate_swa_bounded_replay()</code> 在分配模型权重<strong>之前</strong>检查，任一条不满足就抛 <code>ValueError</code>：</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>要求</th><th>值</th></tr></thead>
+                <tbody>
+                  <tr><td>层数</td><td><code>n_layers == 40</code></td></tr>
+                  <tr><td>滑窗</td><td><code>window_size == 128</code></td></tr>
+                  <tr><td>候选源层</td><td><code>candidate_source_layer_id == 20</code>，且第 20 层是 Full 层</td></tr>
+                  <tr><td>consumer 来源</td><td>第 21–39 层的 <code>main_kv_source_layer</code> 全部是 20</td></tr>
+                  <tr><td>Engram 位置</td><td>没有 engram 层在第 21 层或之后</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>也就是说：<strong>它只对 V4.1-Flash 的那一套 40 层 / source-20 / window-128 布局成立</strong>，换模型就直接拒绝。</p>
+
+            <h3>运行期：哪些批次会真的走这条路</h3>
+            <ul>
+              <li><strong>不走</strong>：处于 ACL 图里（<code>acl_graph is not None</code>），或带 execution state 的批次。<strong>decode 完全不受影响</strong>，包括图的捕获与回放。</li>
+              <li><strong>不走</strong>：这一批所有 DP 副本的最大 token 数都不超过 140 —— 没有可丢的行。</li>
+              <li><strong>走</strong>：其余情况，并且<strong>所有 DP 副本一起走</strong>，空副本也要进。</li>
+            </ul>
+          </section>
+
+          <section class="section wide" id="evidence">
+            <span class="section-number">05</span>
+            <h2>代码证据</h2>
+            <div class="evidence">
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>位置</th><th>负责什么</th></tr></thead>
+                  <tbody>
+                    <tr><td>xllm/python/models/swa_bounded_replay.py</td><td>全部逻辑：<code>validate_swa_bounded_replay</code>、<code>should_run_swa_bounded_replay</code>、<code>run_swa_bounded_consumers</code>；两个常量 <code>SWA_BOUNDED_FIRST_CONSUMER = 21</code>、<code>SWA_BOUNDED_QUERY_ROWS = 140</code></td></tr>
+                    <tr><td>xllm/python/models/deepseek_v41.py</td><td>模型 forward 里的调用点与配置字段</td></tr>
+                    <tr><td>xllm/core/framework/config/model_config.{h,cpp}</td><td><code>enable_swa_bounded_replay</code> 的定义与默认值</td></tr>
+                    <tr><td>tests/python/test_swa_bounded_replay.py</td><td>挑行、metadata 压缩与索引重定基的单测</td></tr>
+                    <tr><td colspan="2"><em>参考实现：</em>DeepInfer <code>deepinfer/model_executor/input_metadata/yoco.py</code>、<code>deepinfer/worker/model_runner.py</code>、<code>examples/yoco/yoco_equiv.py</code></td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="section wide" id="numbers">
+            <span class="section-number">06</span>
+            <h2>收益与验证强度</h2>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">本页不给收益数字</span>
+              我们还没有在这个开关上做过绑定条件的 A/B。<strong>没测过就不写数字</strong>。
+              可以说的是省算的上界：prompt 越长，被丢掉的行占比越高；在 N ≫ 140 时，
+              第 21–39 层（共 19 层，接近一半层数）的 query 行数降到约 <code>140 / N</code>。
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>项</th><th>状态</th></tr></thead>
+                <tbody>
+                  <tr><td>功能实现</td><td><span class="chip chip-good">已实现</span>（xLLM 仓内，opt-in）</td></tr>
+                  <tr><td>数值无损</td><td><span class="chip chip-bad">否</span>，前缀 hidden 为近似</td></tr>
+                  <tr><td>性能收益</td><td><span class="chip chip-warn">未验证</span>，我们未做 A/B</td></tr>
+                  <tr><td>精度影响量化</td><td><span class="chip chip-warn">未验证</span>，没跑过数据集</td></tr>
+                  <tr><td>decode 路径</td><td><span class="chip chip-good">不变</span>，含 ACL 图捕获/回放</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>上游状态</h3>
+            <p>
+              encoder 侧的 bounded replay 已在上游 vLLM 合入。
+              decoder 侧 —— 也就是 CED「prefill 减半」真正依赖的那一半 —— 上游 vLLM 还没合入；
+              vllm-ascend 有实现，开启时要求 MRV2 等条件。我们也还没测过它的实际收益。
+            </p>
+          </section>
+
+          <section class="section" id="risk">
+            <span class="section-number">07</span>
+            <h2>风险与待确认</h2>
+            <ul>
+              <li><strong>精度</strong>：前缀 hidden 近似的影响没有量化过。要用在生产前，至少先补一次数据集对比。</li>
+              <li><strong>不支持 prefix logits</strong>：只有末尾那行输出有效，需要中间位置 logits 的任务不能用。</li>
+              <li><strong>补齐路径</strong>：要做到无损，需要像 DeepInfer 那样重建保留行的 SWA 可见域（pivots），并配一套 mask / compact 等价性对比脚本。这是明确的下一步，当前没有。</li>
+              <li><strong>DP 一致性</strong>：所有副本必须同进同出。改动这块时如果漏了空副本，MoE 的 gather 会尺寸不匹配。</li>
+            </ul>
+          </section>
+
+          <nav class="pager" aria-label="相邻页面">
+            <a href="../dsa-cp/"><span>上一页</span><b>← DSA CP</b></a>
+            <a href="../engram-offload/"><span>下一页</span><b>Engram 主机侧卸载 →</b></a>
+          </nav>
+        </div>
+
+        <aside class="toc" aria-label="本页目录">
+          <p>本页目录</p>
+          <ol>
+            <li><a href="#tldr">结论与适用条件</a></li>
+            <li><a href="#mechanism">机制</a></li>
+            <li><a href="#deepinfer">对照 DeepInfer</a></li>
+            <li><a href="#enable">启用与约束</a></li>
+            <li><a href="#evidence">代码证据</a></li>
+            <li><a href="#numbers">收益与验证强度</a></li>
+            <li><a href="#risk">风险与待确认</a></li>
+          </ol>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell">
+        <p><a href="../">← 回到特性列表</a></p>
+        <p>这是一个显式 opt-in 的有损实验特性。开启前请确认你的任务能接受前缀近似。</p>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -54,3 +54,28 @@ AllReduce 复制完整序列 → 多个 TP rank 重复处理相同 token → 长
 - 使用“TTFT 参考结果”，不泛化为所有模型、shape 或 workload 的固定收益。
 - 明确 MMRS 是可选增量且默认关闭，FlashComm 核心能力不依赖 MMRS。
 - 区分 decoder 末尾的 token-layout gather 与 LM Head 的词表并行 logits 归并。
+
+## 补充：当前仓里哪些模型真的受这个开关影响（2026-11 复核）
+
+FlashComm 的上下文由模型 forward 用 `FlashComm1ContextScope` 建立。全仓建立该 scope 的只有两处：
+
+- `xllm/models/llm/deepseek_v4.h`（DeepSeek-V4，C++ 路径）
+- `xllm/models/llm/qwen3_next_hybrid_base.h`（Qwen3-Next）
+
+**Python 路径的 DeepSeek-V4.1 没有建立这个 scope**，因此给 V4.1 传 `--enable_flashcomm1` 不会生效。
+页面在「结论与适用条件」一节用黄色 callout 显式写了这一点，并在「风险与待确认」里重申：
+如果在 V4.1 上观察到差异，原因不在 FlashComm。
+
+核对方式：`grep -rn "FlashComm1ContextScope" xllm/` 看谁构造了它。
+
+## 补充：页面重做后保留与新增的内容
+
+保留：机制（AllReduce → ReduceScatter）、单层五个边界、padding 对齐到 `TP × 16`
+（常量 `kFc1LocalTokenAlignment = 16`，在 `flash_comm1_context.cpp`）、MMRS 的 fallback 语义、
+TTFT 参考数据与拆分（序列分片约 −11.8%，MMRS 额外约 −1.8%）。
+
+新增：四个运行条件的完整列表（NPU / prefill / `cp_size=1` / token 达阈值 / TP group 可用）、
+`flashcomm1_min_prefill_tokens` 默认 8192 是保守起点而非推荐值、`mmrs_comm_mode` 的取值。
+
+删除：旧页的 hero 指标条里「0 Decode 路径侵入」这类口号式表述，改为在适用条件里直接写
+「它不改 decode 路径，不要指望 TPOT 直接受益」。

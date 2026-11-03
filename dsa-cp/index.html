@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DSA CP｜xLLM 特性解读</title>
+    <meta
+      name="description"
+      content="xLLM DSA CP：DeepSeek-V4.1 稀疏注意力在 TP 组内按 query token 行切分，KV 整份复制，算完用一次 all-to-all 换回全部 token × 本地头。机制、代码位置、约束与口径。"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script defer src="../assets/site.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到正文</a>
+
+    <header class="topbar">
+      <div class="shell topbar-inner">
+        <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">x</span>xLLM / Feature Review</a>
+        <nav class="topnav" aria-label="特性导航">
+          <a href="../">首页</a>
+          <a href="../arch/">V4.1 架构</a>
+          <a href="../flashcomm/">FlashComm</a>
+          <a href="../dspark/">DSpark</a>
+          <a href="../dsa-cp/" aria-current="page">DSA CP</a>
+          <a href="../swa-replay/">SWA 回放</a>
+          <a href="../engram-offload/">Engram 卸载</a>
+        </nav>
+        <div class="topbar-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换配色">☾</button>
+          <a class="ghost-link" href="https://github.com/xLLM-AI/xllm" target="_blank" rel="noreferrer">xllm ↗</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero">
+        <div class="shell">
+          <p class="eyebrow">03 / 注意力并行 · DeepSeek-V4.1</p>
+          <h1>DSA CP：KV 整份复制，只切 query 的 token 行</h1>
+          <p class="hero-lede">
+            常规 TP 把注意力按<strong>头</strong>切：每个 rank 拿 <code>n_heads / TP</code> 个头，但要处理<strong>全部</strong> token 行。
+            DSA CP 反过来：每个 rank 拿<strong>全部 64 个头</strong>，但只处理 <code>1/TP</code> 的 token 行；
+            算完用一次 all-to-all 把「本地 token × 全部头」换成「全部 token × 本地头」，交还给原来的 O 投影。
+          </p>
+          <ul class="chips">
+            <li class="chip chip-good">已实现</li>
+            <li class="chip chip-warn">默认关闭</li>
+            <li class="chip chip-info">仅 Python V4.1 路径 · 仅 NPU</li>
+          </ul>
+        </div>
+      </section>
+
+      <div class="shell doc">
+        <div class="doc-main">
+          <section class="section" id="tldr">
+            <span class="section-number">01</span>
+            <h2>一句话结论与适用条件</h2>
+
+            <div class="summary">
+              <div>
+                <dt>解决什么问题</dt>
+                <dd>V4.1 的稀疏注意力里，有一部分工作是<strong>按 query 行</strong>计费的（逐行的稀疏取数与 metadata）。按头切 TP 并不能把它分摊，每个 rank 都要对全部 token 行做一遍。</dd>
+              </div>
+              <div>
+                <dt>做了什么</dt>
+                <dd>在 TP 组内按 query token 行把一次前向的打包 token 切成等长的连续片。KV 不切、整份复制。各 rank 算完自己那片的全部头，再 all-to-all 换回标准布局。</dd>
+              </div>
+              <div>
+                <dt>什么时候开</dt>
+                <dd>Python 路径的 DeepSeek-V4.1、NPU、<code>tp_size &gt; 1</code>、<code>cp_size = 1</code>、<code>n_heads</code> 能被 <code>tp_size</code> 整除。</dd>
+              </div>
+              <div>
+                <dt>什么时候别开</dt>
+                <dd><code>cp_size &gt; 1</code>（会直接报错）、<code>tp_size = 1</code>（不生效）。它<strong>不省显存</strong>：KV 是整份复制的，而且每个 rank 要存完整的 <code>wq_b</code> 权重。</dd>
+              </div>
+            </div>
+
+            <div class="callout callout-info">
+              <span class="callout-label">实现对标</span>
+              模块 docstring 写明这是「TP-token DSA CP with replicated KV, matching vLLM Ascend's legacy DSACP」，
+              即对齐 vLLM-Ascend 的旧版 DSACP 语义，不是一个新设计。
+            </div>
+          </section>
+
+          <section class="section wide" id="mechanism">
+            <span class="section-number">02</span>
+            <h2>机制：切 query 行，再换回来</h2>
+
+            <figure>
+              <svg viewBox="0 0 860 330" role="img" aria-label="DSA CP 的数据流：按 token 行切片，每个 rank 算全部头，再用 all-to-all 换成全部 token 乘本地头" class="dg">
+                <text class="dg-t" x="20" y="24">① 切片：每 rank 取一段连续的 query 行</text>
+                <rect class="dg-box" x="20" y="36" width="340" height="76" rx="6" />
+                <text class="dg-t-sm" x="34" y="58">打包的 token 行 [num_tokens]</text>
+                <rect class="dg-box-accent" x="34" y="68" width="78" height="30" rx="4" /><text class="dg-t-mono" x="73" y="88" text-anchor="middle">rank0</text>
+                <rect class="dg-box-good" x="116" y="68" width="78" height="30" rx="4" /><text class="dg-t-mono" x="155" y="88" text-anchor="middle">rank1</text>
+                <rect class="dg-box-amber" x="198" y="68" width="78" height="30" rx="4" /><text class="dg-t-mono" x="237" y="88" text-anchor="middle">rank2</text>
+                <rect class="dg-box-dim" x="280" y="68" width="66" height="30" rx="4" /><text class="dg-t-sm" x="313" y="88" text-anchor="middle">pad</text>
+
+                <text class="dg-t" x="430" y="24">② KV 不切，每 rank 一整份</text>
+                <rect class="dg-box" x="430" y="36" width="410" height="76" rx="6" />
+                <text class="dg-t-sm" x="444" y="58">滑窗 KV / 压缩 main KV / Top-K 索引</text>
+                <rect class="dg-box-dim" x="444" y="68" width="124" height="30" rx="4" /><text class="dg-t-sm" x="506" y="88" text-anchor="middle">完整 KV</text>
+                <rect class="dg-box-dim" x="574" y="68" width="124" height="30" rx="4" /><text class="dg-t-sm" x="636" y="88" text-anchor="middle">完整 KV</text>
+                <rect class="dg-box-dim" x="704" y="68" width="124" height="30" rx="4" /><text class="dg-t-sm" x="766" y="88" text-anchor="middle">完整 KV</text>
+
+                <text class="dg-t" x="20" y="150">③ 每 rank 算自己那片的<tspan class="dg-t-key">全部 64 个头</tspan></text>
+                <rect class="dg-box-accent" x="20" y="162" width="150" height="56" rx="6" />
+                <text class="dg-t-sm" x="95" y="184" text-anchor="middle">tokens/TP 行</text>
+                <text class="dg-t-key" x="95" y="202" text-anchor="middle">× 全部 heads</text>
+
+                <path class="dg-line-accent" d="M176 190 h54" /><path class="dg-fill-accent" d="M232 190 l-9 -5 v10 z" />
+                <rect class="dg-box-amber" x="236" y="162" width="160" height="56" rx="6" />
+                <text class="dg-t" x="316" y="186" text-anchor="middle">all_to_all</text>
+                <text class="dg-t-sm" x="316" y="204" text-anchor="middle">TP 组内，一次</text>
+
+                <path class="dg-line-accent" d="M402 190 h54" /><path class="dg-fill-accent" d="M458 190 l-9 -5 v10 z" />
+                <rect class="dg-box-good" x="462" y="162" width="170" height="56" rx="6" />
+                <text class="dg-t-key" x="547" y="184" text-anchor="middle">全部 tokens 行</text>
+                <text class="dg-t-sm" x="547" y="202" text-anchor="middle">× heads/TP</text>
+
+                <path class="dg-line" d="M638 190 h46" /><path class="dg-fill-line" d="M686 190 l-9 -5 v10 z" />
+                <rect class="dg-box" x="690" y="162" width="150" height="56" rx="6" />
+                <text class="dg-t-sm" x="765" y="184" text-anchor="middle">O 投影（row-parallel）</text>
+                <text class="dg-t-sm" x="765" y="202" text-anchor="middle">与关闭 CP 时一致</text>
+
+                <rect class="dg-box-dim" x="20" y="246" width="820" height="66" rx="6" />
+                <text class="dg-t" x="36" y="268">切片只覆盖 query 侧</text>
+                <text class="dg-t-sm" x="36" y="288">被切的：q_b_proj、q 的 RoPE 与反 RoPE、稀疏注意力的逐行计算与取数</text>
+                <text class="dg-t-sm" x="36" y="306">不被切的：q_a_proj / kv_proj（仍吃完整 hidden）、KV 写缓存、indexer 打分</text>
+              </svg>
+              <figcaption>
+                切分是<strong>连续等长</strong>的：<code>per_rank = ceil(num_tokens / world_size)</code>，
+                第 r 个 rank 取 <code>[r·per_rank, (r+1)·per_rank)</code> 与实际 token 数的交集。
+                补齐只在出口 all-to-all 之前加，回来后截回真实 token 数。
+              </figcaption>
+            </figure>
+
+            <h3>因果长度要跟着改</h3>
+            <p>
+              切完行以后，每个 query 行能看到多少 KV 必须重算，否则因果性就错了。<code>DsaCpContext.local_context_lengths()</code> 做这件事：
+            </p>
+            <ul>
+              <li>
+                <strong>prefill</strong>：对每个请求，用 <code>query_suffix</code>（该请求落在本 rank 之后、被切走的尾部行数）
+                把全局 KV 长度减回来，并把本 rank 没有行的请求置 0。
+              </li>
+              <li>
+                <strong>decode（每行一个 query）</strong>：图里的行是固定的，但 KV 长度每次回放都在变。
+                所以用 <code>torch.arange</code> 在<strong>设备上</strong>构造 owner mask，本 rank 不拥有的行长度置 0 ——
+                不把 host 常量拷进图。
+              </li>
+            </ul>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">图模式下的两个约束</span>
+              <p>
+                decode 的 ACL 图里，每个常驻请求行只有一个 query。代码用 <code>is_acl_graph</code> 判断后直接取
+                <code>[1] * seq_lens_q.numel()</code>，<strong>避免 <code>.tolist()</code> 在 capture 期触发同步</strong>。
+              </p>
+              <p>
+                计划对象缓存在当前 <code>ForwardContext</code> 的 <code>layer_shared_cache</code> 里，而不是跨 context 复用。
+                原因是图入口会在 warmup 和 capture 之间复用 execution context，缓存在 ForwardContext 才能保证长度算术被重新捕获、
+                并在每次回放时读到常驻的设备端长度。
+              </p>
+            </div>
+          </section>
+
+          <section class="section wide" id="evidence">
+            <span class="section-number">03</span>
+            <h2>代码证据</h2>
+
+            <div class="evidence">
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>位置</th><th>负责什么</th></tr></thead>
+                  <tbody>
+                    <tr><td>xllm/python/model_executor/dsa_cp.py</td><td>全部核心逻辑：<code>DsaCpContext</code>（切片计划）、<code>local_context_lengths</code>（因果长度）、<code>restore_tp_heads</code>（all-to-all 换轴）、<code>build_dsa_cp_context</code></td></tr>
+                    <tr><td>xllm/python/models/deepseek_v41.py</td><td>attention 层的接入点：开关校验、<code>num_heads</code> 取整份、forward 里 shard / restore 的调用</td></tr>
+                    <tr><td>xllm/core/framework/config/kernel_config.{h,cpp}</td><td><code>enable_dsa_cp</code> 的 gflag 定义、JSON 读取与「仅 NPU」的校验</td></tr>
+                    <tr><td>tests/python/test_dsa_cp.py</td><td>切片计划与长度算术的单测</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <h4>三处关键代码事实</h4>
+            <pre><code># 1. 开 CP 时每个 rank 持有全部头，而不是 n_heads // tp
+num_heads = cfg.n_heads if self.enable_dsa_cp else cfg.n_heads // tp
+
+# 2. 因此 wq_b 的权重不再按头切分（加载时 shard dim 为 None）
+("attn.wq_b", "self_attn.q_b_proj", None if attn.enable_dsa_cp else 0)
+
+# 3. 换轴：本地 token × 全部头  →  全部 token × 本地头
+send = (padded.view(tokens_per_rank, world_size, local_heads, width)
+        .permute(1, 0, 2, 3).contiguous().view(-1, local_heads, width))
+received = distributed.all_to_all(send, world_size, "tp")
+return received[: num_tokens]</code></pre>
+          </section>
+
+          <section class="section wide" id="enable">
+            <span class="section-number">04</span>
+            <h2>启用方式与约束</h2>
+
+            <pre><code>--enable_dsa_cp=true</code></pre>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>条件</th><th>不满足时</th></tr></thead>
+                <tbody>
+                  <tr><td><code>cp_size = 1</code></td><td><b>直接抛错</b>：<code>enable_dsa_cp cannot be combined with cp_size &gt; 1</code></td></tr>
+                  <tr><td><code>n_heads % tp_size == 0</code></td><td><b>直接抛错</b>：<code>enable_dsa_cp requires n_heads divisible by tp_size</code></td></tr>
+                  <tr><td><code>tp_size &gt; 1</code></td><td>静默不生效（<code>enable_dsa_cp and tp &gt; 1</code>）</td></tr>
+                  <tr><td>NPU 后端</td><td>配置解析阶段 <code>CHECK</code> 失败：<code>enable_dsa_cp is only supported on NPU.</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">gflag 帮助文本与代码不一致（待确认）</span>
+              <code>enable_dsa_cp</code> 的帮助文本写的是「…for prefill and chunked prefill. Requires cp_size=1;
+              <strong>decode keeps the original TP path</strong>」。但 <code>dsa_cp.py</code> 里有专门处理 decode ACL 图的分支
+              （<code>is_acl_graph</code> 时取 <code>[1] * rows</code>），attention forward 里的启用判断也没有区分 prefill / decode。
+              <strong>以代码为准：decode 同样会走 CP 路径。</strong>这段帮助文本看起来是旧的，尚未在仓里修正。
+            </div>
+          </section>
+
+          <section class="section wide" id="numbers">
+            <span class="section-number">05</span>
+            <h2>收益与验证强度</h2>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">本页不给 before/after 数字</span>
+              我们手上的 <code>enable_dsa_cp</code> 实测绑定在另一代模型与平台的组合上，口径不能平移到 Python 路径的 V4.1。
+              按本站的规则，<strong>没有在当前配置下实测过的数字就不写</strong>。要用它请自己在目标配置上做 A/B。
+            </div>
+
+            <h3>收益来自哪里 / 不来自哪里</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th></th><th>关闭 DSA CP</th><th>开启 DSA CP</th></tr></thead>
+                <tbody>
+                  <tr><td>每 rank 的 query 行数</td><td>全部 token</td><td><b>约 1/TP</b></td></tr>
+                  <tr><td>每 rank 的头数</td><td><code>n_heads / TP</code></td><td>全部 <code>n_heads</code></td></tr>
+                  <tr><td>KV 显存</td><td>按 TP 分摊</td><td><b>整份复制，不省</b></td></tr>
+                  <tr><td><code>wq_b</code> 权重</td><td>按头切分</td><td><b>每 rank 一整份</b></td></tr>
+                  <tr><td>注意力段的通信</td><td>O 投影后 all_reduce</td><td>多一次 <b>all_to_all</b>，O 投影后仍 all_reduce</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              所以它<strong>不是一个省显存的特性</strong>，也不改变注意力的总 FLOPs。它能赚的是那些
+              <strong>按 query 行计费、无法靠切头分摊</strong>的开销：逐行的稀疏取数、metadata 组织、小算子下发。
+              这部分在 V4.1 的稀疏注意力里占比不小，但具体占多少必须在目标配置上用 profiling 确认。
+            </p>
+
+            <div class="callout callout-info">
+              <span class="callout-label">做 A/B 时注意</span>
+              开 CP 后每个 rank 只剩很少几行 query（尤其 decode），很多「按 token 行补齐」的优化会因此失去收益空间 ——
+              这类优化单独测可能有效，和 DSA CP 同开就归零。<strong>两个特性要一起测，别把各自的收益相加。</strong>
+            </div>
+          </section>
+
+          <section class="section" id="risk">
+            <span class="section-number">06</span>
+            <h2>风险与待确认</h2>
+            <ul>
+              <li>帮助文本与实际 decode 行为不一致（见<a href="#enable">第 4 节</a>），依赖该文本做部署判断会出错。</li>
+              <li>每 rank 多存一份完整 <code>wq_b</code>，HBM 预算要相应留出。</li>
+              <li>与其他「按 token 行切分」的优化存在收益重叠，不能叠加估算。</li>
+              <li>与 <code>cp_size &gt; 1</code> 的 PCP 路径互斥，两者不能同时用。</li>
+            </ul>
+          </section>
+
+          <nav class="pager" aria-label="相邻页面">
+            <a href="../dspark/"><span>上一页</span><b>← DSpark</b></a>
+            <a href="../swa-replay/"><span>下一页</span><b>SWA Bounded Replay →</b></a>
+          </nav>
+        </div>
+
+        <aside class="toc" aria-label="本页目录">
+          <p>本页目录</p>
+          <ol>
+            <li><a href="#tldr">结论与适用条件</a></li>
+            <li><a href="#mechanism">机制</a></li>
+            <li><a href="#evidence">代码证据</a></li>
+            <li><a href="#enable">启用与约束</a></li>
+            <li><a href="#numbers">收益与验证强度</a></li>
+            <li><a href="#risk">风险与待确认</a></li>
+          </ol>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell">
+        <p><a href="../">← 回到特性列表</a></p>
+        <p>代码事实取自 xLLM-AI/xllm 仓库当前 main；标为「待确认」的地方请以代码为准。</p>
+      </div>
+    </footer>
+  </body>
+</html>

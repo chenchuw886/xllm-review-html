@@ -3,293 +3,306 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="xLLM FlashComm 特性解读：从推理请求到文字输出，理解长 Prefill 通信优化与 TTFT 收益。" />
-    <meta name="theme-color" content="#07110f" />
-    <title>xLLM FlashComm｜让长 Prefill 少做重复功</title>
-    <link rel="stylesheet" href="./styles.css" />
-    <script defer src="./app.js"></script>
+    <title>FlashComm｜xLLM 特性解读</title>
+    <meta
+      name="description"
+      content="xLLM FlashComm：长 prefill 把 row-parallel 线性层后的 AllReduce 换成 ReduceScatter，每个 TP rank 只处理 S/TP 行 token。机制、代码位置、启用方式与适用边界。"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script defer src="../assets/site.js"></script>
   </head>
   <body>
     <a class="skip-link" href="#main">跳到正文</a>
 
     <header class="topbar">
-      <a class="brand" href="#top" aria-label="回到顶部">
-        <span class="brand-mark" aria-hidden="true">x</span>
-        <span>xLLM / Feature Review</span>
-      </a>
-      <nav class="topnav" aria-label="页面导航">
-        <a href="#why">为什么</a>
-        <a href="#journey">完整链路</a>
-        <a href="#inside">模型内部</a>
-        <a href="#evidence">收益</a>
-        <a href="#enable">启用</a>
-      </nav>
-      <a class="source-link" href="https://github.com/xLLM-AI/xllm/pull/2022" target="_blank" rel="noreferrer">PR #2022 ↗</a>
+      <div class="shell topbar-inner">
+        <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">x</span>xLLM / Feature Review</a>
+        <nav class="topnav" aria-label="特性导航">
+          <a href="../">首页</a>
+          <a href="../arch/">V4.1 架构</a>
+          <a href="../flashcomm/" aria-current="page">FlashComm</a>
+          <a href="../dspark/">DSpark</a>
+          <a href="../dsa-cp/">DSA CP</a>
+          <a href="../swa-replay/">SWA 回放</a>
+          <a href="../engram-offload/">Engram 卸载</a>
+        </nav>
+        <div class="topbar-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换配色">☾</button>
+          <a class="ghost-link" href="https://github.com/xLLM-AI/xllm" target="_blank" rel="noreferrer">xllm ↗</a>
+        </div>
+      </div>
     </header>
 
     <main id="main">
-      <section class="hero" id="top" aria-labelledby="hero-title">
-        <div class="hero-glow hero-glow-a" aria-hidden="true"></div>
-        <div class="hero-glow hero-glow-b" aria-hidden="true"></div>
-        <div class="hero-copy">
-          <p class="eyebrow"><span></span>xLLM · NPU · Tensor Parallel</p>
-          <h1 id="hero-title">Flash<span>Comm</span></h1>
-          <p class="hero-line">让每个 TP rank，只处理自己的 token。</p>
-          <p class="hero-desc">长 Prompt 的 Prefill 阶段，把 <code>AllReduce</code> 换成 <code>ReduceScatter</code>。通信完成时，序列分片也完成。</p>
-          <div class="hero-actions">
-            <a class="button button-primary" href="#journey">看完整推理链路</a>
-            <a class="button button-ghost" href="#mechanism">60 秒看懂原理</a>
-          </div>
+      <section class="hero">
+        <div class="shell">
+          <p class="eyebrow">01 / Prefill 通信优化</p>
+          <h1>FlashComm：让每个 TP rank 只处理自己那份 token</h1>
+          <p class="hero-lede">
+            问题不是「算不动」，是「重复做」。Tensor Parallel 把权重切开了，但 row-parallel 线性层后的 <code>AllReduce</code>
+            又让每个 rank 拿回一份完整序列。FlashComm 把这一步换成 <code>ReduceScatter</code>：
+            通信在求和的同时就完成了按 token 的切分，之后的安全区段每个 rank 只留约 <code>S/TP</code> 行。
+          </p>
+          <ul class="chips">
+            <li class="chip chip-good">已实现</li>
+            <li class="chip chip-warn">默认关闭</li>
+            <li class="chip chip-info">仅 prefill · 仅 NPU</li>
+          </ul>
         </div>
+      </section>
 
-        <div class="hero-visual" aria-label="四个 TP rank 从完整序列副本变为各自序列分片">
-          <div class="visual-head">
-            <span>每个 rank 的 token 布局</span>
-            <span class="live-dot">PREFILL</span>
-          </div>
-          <div class="rank-compare">
-            <div class="rank-state rank-before">
-              <p>Baseline · full sequence</p>
-              <div class="rank-list">
-                <div><b>TP 0</b><span class="tokens full"><i></i><i></i><i></i><i></i></span></div>
-                <div><b>TP 1</b><span class="tokens full"><i></i><i></i><i></i><i></i></span></div>
-                <div><b>TP 2</b><span class="tokens full"><i></i><i></i><i></i><i></i></span></div>
-                <div><b>TP 3</b><span class="tokens full"><i></i><i></i><i></i><i></i></span></div>
+      <div class="shell doc">
+        <div class="doc-main">
+          <section class="section" id="tldr">
+            <span class="section-number">01</span>
+            <h2>一句话结论与适用条件</h2>
+
+            <div class="summary">
+              <div>
+                <dt>解决什么问题</dt>
+                <dd>长 prompt 的 prefill 里，TP 组内每个 rank 都持有并处理完整的 <code>[S, H]</code> 序列，通信量和可分片区段的计算量都是重复的。</dd>
+              </div>
+              <div>
+                <dt>做了什么</dt>
+                <dd>把 row-parallel 层后的 <code>all_reduce</code> 改成 <code>reduce_scatter</code>，在需要完整序列的边界处再 gather 还原。可选再把 matmul 和 reduce_scatter 融成一个算子。</dd>
+              </div>
+              <div>
+                <dt>什么时候开</dt>
+                <dd>NPU 后端、长输入 prefill（默认阈值 8192 token）、<code>cp_size=1</code>、prefill 在端到端时延里占比高（如 8K/128、32K/1K）。</dd>
+              </div>
+              <div>
+                <dt>什么时候别开</dt>
+                <dd>短输入（低于阈值不会触发）、长输出 / decode 占比高的场景、<code>cp &gt; 1</code>。它不改 decode 路径，不要指望 TPOT 直接受益。</dd>
               </div>
             </div>
-            <div class="switch-arrow" aria-hidden="true"><span>AR</span><b>→</b><span>RS</span></div>
-            <div class="rank-state rank-after">
-              <p>FlashComm · local shard</p>
-              <div class="rank-list">
-                <div><b>TP 0</b><span class="tokens shard s0"><i></i></span><em>S/4</em></div>
-                <div><b>TP 1</b><span class="tokens shard s1"><i></i></span><em>S/4</em></div>
-                <div><b>TP 2</b><span class="tokens shard s2"><i></i></span><em>S/4</em></div>
-                <div><b>TP 3</b><span class="tokens shard s3"><i></i></span><em>S/4</em></div>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">先说清楚适用的模型范围</span>
+              FlashComm 的上下文由模型 forward 建立。当前仓里建立这个 scope 的只有两处：
+              <code>xllm/models/llm/deepseek_v4.h</code>（DeepSeek-V4，C++ 路径）和
+              <code>xllm/models/llm/qwen3_next_hybrid_base.h</code>（Qwen3-Next）。
+              <strong>Python 路径的 DeepSeek-V4.1 没有建立这个 scope，给它传 <code>--enable_flashcomm1</code> 不会生效。</strong>
+            </div>
+          </section>
+
+          <section class="section wide" id="mechanism">
+            <span class="section-number">02</span>
+            <h2>机制：一次 collective 同时完成求和与切分</h2>
+            <p class="section-note">输入 → 处理 → 输出。</p>
+
+            <figure>
+              <svg viewBox="0 0 860 320" role="img" aria-label="Baseline 用 AllReduce 后每个 rank 持有完整序列；FlashComm 用 ReduceScatter 后每个 rank 只持有 S/TP 行" class="dg">
+                <text class="dg-t" x="20" y="24">Baseline</text>
+                <text class="dg-t-sm" x="20" y="42">local Matmul partial → TP AllReduce</text>
+                <rect class="dg-box" x="20" y="54" width="300" height="86" rx="6" />
+                <text class="dg-t-mono" x="34" y="78">TP0</text><rect class="dg-box-accent" x="76" y="66" width="228" height="14" rx="3" />
+                <text class="dg-t-mono" x="34" y="100">TP1</text><rect class="dg-box-accent" x="76" y="88" width="228" height="14" rx="3" />
+                <text class="dg-t-mono" x="34" y="122">TP2</text><rect class="dg-box-accent" x="76" y="110" width="228" height="14" rx="3" />
+                <text class="dg-t-sm" x="20" y="162">每个 rank 都持有完整的 [S, H]</text>
+                <text class="dg-t-sm" x="20" y="180">→ 后续可分片区段被重复处理 TP 次</text>
+
+                <path class="dg-line-accent" d="M350 100 h60" />
+                <path class="dg-fill-accent" d="M412 100 l-9 -5 v10 z" />
+                <text class="dg-t-key" x="380" y="88" text-anchor="middle">AR → RS</text>
+
+                <text class="dg-t" x="440" y="24">FlashComm</text>
+                <text class="dg-t-sm" x="440" y="42">local Matmul partial → TP ReduceScatter</text>
+                <rect class="dg-box-good" x="440" y="54" width="300" height="86" rx="6" />
+                <text class="dg-t-mono" x="454" y="78">TP0</text><rect class="dg-box-accent" x="496" y="66" width="76" height="14" rx="3" />
+                <text class="dg-t-mono" x="454" y="100">TP1</text><rect class="dg-box-accent" x="572" y="88" width="76" height="14" rx="3" />
+                <text class="dg-t-mono" x="454" y="122">TP2</text><rect class="dg-box-accent" x="648" y="110" width="76" height="14" rx="3" />
+                <text class="dg-t-sm" x="440" y="162">每个 rank 只持有 [S/TP, H]</text>
+                <text class="dg-t-sm" x="440" y="180">→ 各 rank 的分片拼起来刚好覆盖 S</text>
+
+                <rect class="dg-box-dim" x="20" y="208" width="720" height="92" rx="6" />
+                <text class="dg-t" x="36" y="232">一层里的边界（DeepSeek-V4）</text>
+                <text class="dg-t-sm" x="36" y="254">① Attention 前 gather 回完整序列　② DSAttention 的 row-parallel 输出用 ReduceScatter，输出 local shard</text>
+                <text class="dg-t-sm" x="36" y="272">③ HC residual 区段在 local shard 上执行　④ MoE gate 前 gather 回完整序列（保证路由语义不变）</text>
+                <text class="dg-t-sm" x="36" y="290">⑤ MoE 输出后按序列重新切片，进入下一层</text>
+              </svg>
+              <figcaption>
+                模型级：完整 hidden states → <code>shard_sequence()</code> → TP-local rows → decoder layers → <code>gather_sequence()</code> → 完整 hidden states → final head。
+              </figcaption>
+            </figure>
+
+            <h3>两层能力，收益来源不同</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>能力</th><th>做法</th><th>覆盖范围</th><th>地位</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>序列维度分片</b></td>
+                    <td><code>all_reduce</code> → <code>reduce_scatter</code>，边界处 gather 还原</td>
+                    <td>所有 dtype（BF16 与各类量化）</td>
+                    <td><b>核心，收益主要来源</b></td>
+                  </tr>
+                  <tr>
+                    <td><b>MMRS 融合算子</b></td>
+                    <td><code>matmul + reduce_scatter</code> → <code>npu_mm_reduce_scatter_base</code></td>
+                    <td>BF16 与 w8a8_dynamic 两条路径</td>
+                    <td>可选增量，默认关闭</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>两个实现细节</h3>
+            <ul>
+              <li>
+                <strong>Padding</strong>：全局 token 数向上补齐到 <code>TP × 16</code> 的倍数（<code>kFc1LocalTokenAlignment = 16</code>），
+                保证各 rank 的 collective 等长；最终 gather 后截回真实 token 数。
+              </li>
+              <li>
+                <strong>Fallback</strong>：MMRS 的 dtype、shape、bias 或运行条件不满足时，退回普通 matmul + reduce_scatter。
+                数值一致，只是少了 kernel 融合，<strong>FlashComm 的核心语义仍然成立</strong>。
+              </li>
+            </ul>
+
+            <div class="callout callout-info">
+              <span class="callout-label">为什么这能变成 TTFT 收益</span>
+              AllReduce 复制完整序列 → 多个 TP rank 重复处理相同 token → 长 prefill 的通信和可分片计算成本偏高。
+              ReduceScatter 在归并时直接完成序列分片 → 安全区段每 rank 只处理约 <code>S/TP</code> 行 →
+              prompt forward 更早结束 → LM head 和采样更早拿到首 token → 用户更早看到第一个字。
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">表述边界</span>
+              <p>这是「减少重复的 token 处理和中间激活复制」，<strong>不是</strong>「所有算力严格下降到 1/TP」。</p>
+              <p>decoder 末尾的 token-layout gather，和 LM head 的词表并行 logits 归并，是两件不同的事，不要混为一谈。</p>
+            </div>
+          </section>
+
+          <section class="section wide" id="evidence">
+            <span class="section-number">03</span>
+            <h2>代码证据</h2>
+            <p class="section-note">想自己读源码时从这几个文件进。</p>
+
+            <div class="evidence">
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>文件</th><th>负责什么</th></tr></thead>
+                  <tbody>
+                    <tr><td>core/common/flash_comm1_context.{h,cpp}</td><td>启用门槛、padding 对齐、shard / gather / reduce-scatter；<code>FlashComm1ContextScope</code> 是 thread-local 作用域</td></tr>
+                    <tr><td>models/llm/deepseek_v4.h</td><td>DeepSeek-V4 的模型级 context、首尾 shard/gather、final head 边界</td></tr>
+                    <tr><td>models/llm/qwen3_next_hybrid_base.h</td><td>Qwen3-Next 的模型级 context</td></tr>
+                    <tr><td>core/layers/deepseek_v4_decoder_layer.cpp</td><td>Attention / MoE 的完整序列边界</td></tr>
+                    <tr><td>core/layers/common/linear.cpp</td><td>row-parallel reduce mode、BF16 / W8A8-dynamic 的 MMRS 与 fallback</td></tr>
+                    <tr><td>core/runtime/worker_impl.cpp</td><td>把运行时 options 传进 FlashComm 配置</td></tr>
+                  </tbody>
+                </table>
               </div>
             </div>
-          </div>
-          <div class="visual-foot"><span>不改模型</span><span>不建新通信组</span><span>只改中间布局</span></div>
-        </div>
+          </section>
 
-        <div class="hero-metrics" aria-label="核心结论">
-          <div><strong>−13.4%</strong><span>参考 TTFT</span></div>
-          <div><strong>≈ S / TP</strong><span>安全区段本地 token rows</span></div>
-          <div><strong>0</strong><span>Decode 路径侵入</span></div>
-        </div>
-      </section>
+          <section class="section wide" id="enable">
+            <span class="section-number">04</span>
+            <h2>启用方式与约束</h2>
 
-      <section class="section" id="why">
-        <div class="section-heading">
-          <p class="kicker">01 / WHY</p>
-          <h2>问题不在“算不动”，而在<strong>重复做</strong></h2>
-          <p>Tensor Parallel 把权重切开，但 Baseline 的 Row-Parallel 输出经 AllReduce 后，每个 rank 又拿回一份完整序列。长 Prompt 越长，这份重复越贵。</p>
-        </div>
-        <div class="problem-grid">
-          <article class="problem-card muted-card">
-            <span class="card-index">BEFORE</span>
-            <h3>AllReduce：每张卡都有完整答案</h3>
-            <p>各 rank 的 Matmul 局部结果先求和，再把完整 <code>[S, H]</code> 广播给所有 rank。</p>
-            <div class="equation"><span>TP ranks</span><b>×</b><span>full S rows</span><b>=</b><em>重复 token work</em></div>
-          </article>
-          <article class="problem-card accent-card">
-            <span class="card-index">AFTER</span>
-            <h3>ReduceScatter：求和后直接分片</h3>
-            <p>同一次 collective 完成“求和 + 按 token 切分”，每个 rank 只留下 <code>[S/TP, H]</code>。</p>
-            <div class="equation"><span>TP ranks</span><b>×</b><span>S/TP rows</span><b>=</b><em>刚好覆盖 S</em></div>
-          </article>
-        </div>
-        <div class="plain-callout"><b>一句话：</b>FlashComm 不减少模型层数，也不改变输出；它减少的是 TP ranks 之间不必要的完整序列复制与可分片区段的重复处理。</div>
-      </section>
+            <p>核心收益（序列分片 + reduce_scatter）一个开关就够：</p>
+            <pre><code>--enable_flashcomm1=true</code></pre>
 
-      <section class="section journey-section" id="journey">
-        <div class="section-heading">
-          <p class="kicker">02 / END-TO-END</p>
-          <h2>从输入一句话，到输出第一个字</h2>
-          <p>FlashComm 只加速其中一段，但它恰好位于首 token 必经的 Prefill 主链路上。</p>
-        </div>
-
-        <div class="journey" data-journey>
-          <div class="journey-tabs" role="tablist" aria-label="推理阶段">
-            <button class="journey-tab active" role="tab" aria-selected="true" data-phase="prefill">首 token · Prefill</button>
-            <button class="journey-tab" role="tab" aria-selected="false" data-phase="decode">后续 token · Decode</button>
-          </div>
-
-          <div class="journey-track phase-prefill" data-journey-track>
-            <article class="journey-step">
-              <span>01</span><div class="step-icon">Aa</div><h3>请求与分词</h3><p>Prompt 变成 token IDs</p>
-            </article>
-            <article class="journey-step">
-              <span>02</span><div class="step-icon">≋</div><h3>调度与组 Batch</h3><p>Scheduler 准备 Prefill</p>
-            </article>
-            <article class="journey-step flash-step">
-              <span>03</span><div class="step-icon">⚡</div><h3>模型 Prefill</h3><p>FlashComm 在这里生效</p><em>OPTIMIZED</em>
-            </article>
-            <article class="journey-step">
-              <span>04</span><div class="step-icon">Σ</div><h3>Logits 与采样</h3><p>选出第一个 token</p>
-            </article>
-            <article class="journey-step">
-              <span>05</span><div class="step-icon">“</div><h3>增量解码</h3><p>Token ID 变成文字</p>
-            </article>
-            <article class="journey-step output-step">
-              <span>06</span><div class="step-icon">↗</div><h3>流式输出</h3><p>用户看到第一个字</p>
-            </article>
-          </div>
-
-          <div class="journey-note" data-prefill-note>
-            <div><span class="pulse"></span><b>收益闭环</b></div>
-            <p>Prefill 少等待 → Model Forward 更早结束 → LM Head 更早拿到 hidden states → Sampler 更早选出首 token → Incremental Decoder 更早输出文字 → <strong>TTFT 降低</strong></p>
-          </div>
-        </div>
-      </section>
-
-      <section class="section" id="inside">
-        <div class="section-heading">
-          <p class="kicker">03 / MODEL ARCHITECTURE</p>
-          <h2>完整模型链路，FlashComm 在哪里？</h2>
-          <p>以 DeepSeek V4 为例。绿色节点保持 TP-local shard；黄色节点恢复完整序列，守住 Attention 与 MoE 的正确性边界。</p>
-        </div>
-
-        <div class="architecture-shell">
-          <div class="arch-rail" aria-label="DeepSeek V4 模型整体链路">
-            <div class="arch-node neutral"><span>Input IDs</span><b>Embedding</b><small>[S, H]</small></div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node local"><span>FlashComm</span><b>Sequence Shard</b><small>[S/TP, H]</small></div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node stack"><span>× N Layers</span><b>Decoder Stack</b><small>见下方单层展开</small></div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node boundary"><span>Final boundary</span><b>Gather Sequence</b><small>[S, H]</small></div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node neutral"><span>Output head</span><b>HC Head + Norm</b><small>full tokens</small></div>
-            <div class="arch-arrow">→</div>
-            <div class="arch-node neutral"><span>Vocabulary</span><b>LM Head</b><small>full logits</small></div>
-          </div>
-
-          <div class="layer-card">
-            <div class="layer-title"><span>ONE DEEPSEEK V4 DECODER LAYER</span><b>安全区段尽量 local，语义边界恢复 full</b></div>
-            <div class="layer-flow" aria-label="DeepSeek V4 单层 FlashComm 数据流">
-              <div class="layer-node local"><i>LOCAL</i><b>Layer Input</b><small>S/TP rows</small></div>
-              <div class="layer-link gather"><span>AllGather</span></div>
-              <div class="layer-node full"><i>FULL</i><b>Norm + DSAttention</b><small>完整 token 语义</small></div>
-              <div class="layer-link rs"><span>o_b_proj<br />ReduceScatter</span></div>
-              <div class="layer-node local"><i>LOCAL</i><b>HC Residual</b><small>S/TP rows</small></div>
-              <div class="layer-link gather"><span>AllGather</span></div>
-              <div class="layer-node full"><i>FULL</i><b>Gate + MoE</b><small>完整路由语义</small></div>
-              <div class="layer-link slice"><span>Local Slice</span></div>
-              <div class="layer-node local"><i>LOCAL</i><b>Next Layer</b><small>S/TP rows</small></div>
-            </div>
-            <div class="layer-legend"><span><i class="dot local-dot"></i>分片布局</span><span><i class="dot full-dot"></i>完整布局</span><span><i class="line-dot"></i>布局转换</span></div>
-          </div>
-        </div>
-      </section>
-
-      <section class="section" id="mechanism">
-        <div class="section-heading compact-heading">
-          <p class="kicker">04 / MECHANISM</p>
-          <h2>两层优化，先核心、后融合</h2>
-        </div>
-        <div class="mechanism-grid">
-          <article class="mechanism-card core-card">
-            <div class="mechanism-top"><span>CORE</span><em>主要收益</em></div>
-            <h3>Sequence Shard + ReduceScatter</h3>
-            <div class="mini-flow"><span>Matmul</span><b>→</b><span>ReduceScatter</span><b>→</b><strong>[S/TP, H]</strong></div>
-            <ul>
-              <li>由 <code>--enable_flashcomm1=true</code> 开启</li>
-              <li>所有已接入 dtype 都可走普通 RS 路径</li>
-              <li>在完整序列边界按需 AllGather</li>
-            </ul>
-          </article>
-          <article class="mechanism-card fusion-card">
-            <div class="mechanism-top"><span>OPTIONAL</span><em>额外增量</em></div>
-            <h3>MMRS Fused Operator</h3>
-            <div class="mini-flow fused"><span>Matmul</span><b>+</b><span>ReduceScatter</span><b>→</b><strong>1 op</strong></div>
-            <ul>
-              <li>当前覆盖 BF16 / w8a8_dynamic</li>
-              <li>减少 kernel launch 与通信调度</li>
-              <li>shape 不支持或执行失败时回退普通 RS</li>
-            </ul>
-          </article>
-        </div>
-        <div class="fallback-line"><span>MMRS 未命中</span><b>≠</b><span>FlashComm 失效</span><i>核心分片路径仍然成立</i></div>
-      </section>
-
-      <section class="section evidence-section" id="evidence">
-        <div class="section-heading">
-          <p class="kicker">05 / EVIDENCE</p>
-          <h2>最终收益：更早拿到首 token</h2>
-          <p>参考 workload 下，序列分片贡献主要收益；MMRS 是在核心路径之上的额外增量。</p>
-        </div>
-        <div class="evidence-grid">
-          <div class="chart-card">
-            <div class="chart-head"><h3>TTFT 对比</h3><span>单位：ms · 越低越好</span></div>
-            <div class="bar-row">
-              <div class="bar-label"><b>Baseline</b><span>10,211.2</span></div>
-              <div class="bar-track"><i class="bar baseline-bar" style="--bar: 100%"></i></div>
-            </div>
-            <div class="bar-row">
-              <div class="bar-label"><b>FlashComm + MMRS</b><span>8,840.9</span></div>
-              <div class="bar-track"><i class="bar flash-bar" style="--bar: 86.6%"></i></div>
-            </div>
-            <div class="chart-result"><strong>−1,370.3 ms</strong><span>首 token 提前约 1.37 秒</span></div>
-          </div>
-          <div class="breakdown-card">
-            <p>TTFT 改善拆解</p>
-            <div class="donut" role="img" aria-label="序列分片约贡献 11.8%，MMRS 约贡献额外 1.8%"><div><strong>−13.4%</strong><span>整体 TTFT</span></div></div>
-            <div class="breakdown-legend"><span><i></i>≈ −11.8% 序列分片</span><span><i></i>≈ −1.8% MMRS 增量</span></div>
-          </div>
-        </div>
-        <div class="benchmark-note">
-          <b>测试口径</b>
-          <span>DeepSeek-V4-Flash</span><span>W8A8C16</span><span>Ascend A3</span><span>EP16 / DP4 / TP4</span><span>8K input</span><span>Concurrency 32</span>
-          <p>这是一组参考结果，不代表所有模型与 workload。FlashComm 直接优化 Prefill，应优先观察 TTFT 与 Prompt Throughput；TPOT 并非其直接目标。</p>
-        </div>
-      </section>
-
-      <section class="section" id="enable">
-        <div class="section-heading">
-          <p class="kicker">06 / ACTIVATE</p>
-          <h2>四个门槛，同时满足才生效</h2>
-          <p>条件不满足时 context 保持 disabled，自动走原路径。</p>
-        </div>
-        <div class="gate-grid">
-          <article><span>01</span><i>开关</i><b>enable_flashcomm1</b><em>= true</em></article>
-          <article><span>02</span><i>阶段</i><b>Prefill</b><em>非 Decode</em></article>
-          <article><span>03</span><i>并行</i><b>CP = 1</b><em>复用 TP group</em></article>
-          <article><span>04</span><i>长度</i><b>tokens ≥ 8192*</b><em>默认阈值</em></article>
-        </div>
-        <div class="command-grid">
-          <div class="command-card">
-            <span>推荐从核心路径开始</span>
-            <pre><code>--enable_flashcomm1=true</code><button class="copy-button" data-copy="--enable_flashcomm1=true">复制</button></pre>
-          </div>
-          <div class="command-card optional-command">
-            <span>验证 shape 稳定后，再评估 MMRS</span>
+            <p>MMRS 是在此基础上的可选增量，只在 <code>enable_flashcomm1=true</code> 时才被读取：</p>
             <pre><code>--enable_flashcomm1=true \
---enable_mmrs_fusion=true</code><button class="copy-button" data-copy="--enable_flashcomm1=true --enable_mmrs_fusion=true">复制</button></pre>
-          </div>
-        </div>
-        <p class="threshold-note">* 8192 是保守默认值。真正的 break-even 与模型、并行度、dtype、输入长度和并发有关，应以实测为准。</p>
-      </section>
+--enable_mmrs_fusion=true</code></pre>
 
-      <section class="section takeaways" id="summary">
-        <div class="section-heading compact-heading">
-          <p class="kicker">07 / TAKEAWAY</p>
-          <h2>最后，只记住三句话</h2>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+                <tbody>
+                  <tr><td><code>enable_flashcomm1</code></td><td><code>false</code></td><td>总开关</td></tr>
+                  <tr><td><code>enable_mmrs_fusion</code></td><td><code>false</code></td><td>Matmul + ReduceScatter 融合算子。默认关闭，因为融合内核在部分 shape 上仍可能失败</td></tr>
+                  <tr><td><code>flashcomm1_min_prefill_tokens</code></td><td><code>8192</code></td><td>prefill token 数达到该阈值才允许启用</td></tr>
+                  <tr><td><code>mmrs_comm_mode</code></td><td><code>aiv</code></td><td>torch_npu MMRS 通信模式，可选 <code>aiv</code> / <code>ai_cpu</code> / <code>none</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>开关打开后，还要同时满足运行条件才会真正生效：</p>
+            <ul>
+              <li>NPU 后端</li>
+              <li>处于 prefill 阶段</li>
+              <li><code>cp_size = 1</code></li>
+              <li>token 数达到阈值</li>
+              <li>TP group 可用</li>
+            </ul>
+            <p>任一条不满足就走原有执行路径，不报错。</p>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">阈值要按模型调</span>
+              <code>flashcomm1_min_prefill_tokens</code> 的最优值与模型参数量相关，不同模型的收益拐点不同。
+              默认的 8192 是一个偏保守的通用起点，不是推荐值。建议在各模型的部署文档里给经过验证的配置。
+            </div>
+          </section>
+
+          <section class="section wide" id="numbers">
+            <span class="section-number">05</span>
+            <h2>收益与验证强度</h2>
+
+            <div class="callout callout-info">
+              <span class="callout-label">测试条件</span>
+              DeepSeek-V4-Flash W8A8C16 · Atlas A3 · EP16 / DP4 / TP4 · 输入 8K · 并发 32。
+              <strong>换任何一项条件，下面的数字都不成立。</strong>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>配置</th><th class="num">TTFT</th><th class="num">相对 baseline</th></tr></thead>
+                <tbody>
+                  <tr><td>Baseline</td><td class="num">10211.2 ms</td><td class="num">—</td></tr>
+                  <tr><td>FlashComm（序列分片）</td><td class="num">—</td><td class="num">约 −11.8%</td></tr>
+                  <tr><td>FlashComm + MMRS</td><td class="num">8840.9 ms</td><td class="num"><b>约 −13.4%</b></td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              也就是说：<strong>序列分片贡献约 −11.8%，MMRS 再额外贡献约 −1.8%</strong>。
+              核心能力不依赖 MMRS，这也是 MMRS 默认关闭不影响主收益的原因。
+            </p>
+
+            <h3>验证强度</h3>
+            <ul>
+              <li><strong>已实测</strong>：上面这一组条件下的 TTFT。</li>
+              <li><strong>未验证</strong>：其他模型、其他 shape、其他并发下的收益拐点；MMRS 在未覆盖 shape 上的稳定性。</li>
+              <li><strong>不应宣称</strong>：TPOT 收益。FlashComm 不介入 decode 循环。</li>
+            </ul>
+          </section>
+
+          <section class="section" id="risk">
+            <span class="section-number">06</span>
+            <h2>风险与待确认</h2>
+            <ul>
+              <li>MMRS 融合内核在部分 shape 上会失败，这是它默认关闭的原因；开启前需要在目标 shape 上先验证。</li>
+              <li>Python 路径的 DeepSeek-V4.1 不受这个开关影响（见<a href="#tldr">第 1 节</a>）。如果在 V4.1 上看到了差异，原因不在 FlashComm。</li>
+              <li>短输入场景下，切分、gather 和调度开销可能抵消收益。阈值机制只是保底，不代表过了阈值就一定赚。</li>
+            </ul>
+          </section>
+
+          <nav class="pager" aria-label="相邻页面">
+            <a href="../arch/"><span>上一页</span><b>← DeepSeek-V4.1-Flash 模型结构</b></a>
+            <a href="../dspark/"><span>下一页</span><b>DSpark · 投机解码 →</b></a>
+          </nav>
         </div>
-        <div class="takeaway-grid">
-          <article><span>01</span><h3>不改模型语义</h3><p>同一份模型、同一个 TP group；只改变中间通信与张量布局。</p></article>
-          <article><span>02</span><h3>主收益来自分片</h3><p>ReduceScatter 让安全区段每个 rank 只处理自己的 token rows。</p></article>
-          <article><span>03</span><h3>用户感知是首字更快</h3><p>长 Prefill 更早结束，首 token 更早采样并转成文字；Decode 不直接加速。</p></article>
-        </div>
-      </section>
+
+        <aside class="toc" aria-label="本页目录">
+          <p>本页目录</p>
+          <ol>
+            <li><a href="#tldr">结论与适用条件</a></li>
+            <li><a href="#mechanism">机制</a></li>
+            <li><a href="#evidence">代码证据</a></li>
+            <li><a href="#enable">启用与约束</a></li>
+            <li><a href="#numbers">收益与验证强度</a></li>
+            <li><a href="#risk">风险与待确认</a></li>
+          </ol>
+        </aside>
+      </div>
     </main>
 
-    <footer>
-      <div><span class="brand-mark small-mark" aria-hidden="true">x</span><b>xLLM FlashComm</b></div>
-      <p>基于 xLLM PR #2022 与 main 分支实现整理 · 页面更新时间 2026-08</p>
-      <div class="footer-links">
-        <a href="https://github.com/xLLM-AI/xllm/pull/2022" target="_blank" rel="noreferrer">Pull Request ↗</a>
-        <a href="https://github.com/xLLM-AI/xllm/blob/main/docs/src/content/docs/zh/features/flashcomm.md" target="_blank" rel="noreferrer">Feature Docs ↗</a>
-        <a href="https://github.com/xLLM-AI/xllm/blob/main/xllm/core/common/flash_comm1_context.cpp" target="_blank" rel="noreferrer">Source ↗</a>
+    <footer class="site-footer">
+      <div class="shell">
+        <p><a href="../">← 回到特性列表</a></p>
+        <p>分析基线：xLLM-AI/xllm main。性能数字只在本页标注的测试条件下成立。</p>
       </div>
     </footer>
   </body>

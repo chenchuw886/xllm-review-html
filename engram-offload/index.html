@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Engram 主机侧卸载｜xLLM 特性解读</title>
+    <meta
+      name="description"
+      content="xLLM Engram host offload：把 DeepSeek-V4.1 的 int8 n-gram 表放到 host 内存，用融合 CPU 算子查表去量化再回传，换取 HBM 预算。配置、约束、DP 共享与风险。"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script defer src="../assets/site.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到正文</a>
+
+    <header class="topbar">
+      <div class="shell topbar-inner">
+        <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">x</span>xLLM / Feature Review</a>
+        <nav class="topnav" aria-label="特性导航">
+          <a href="../">首页</a>
+          <a href="../arch/">V4.1 架构</a>
+          <a href="../flashcomm/">FlashComm</a>
+          <a href="../dspark/">DSpark</a>
+          <a href="../dsa-cp/">DSA CP</a>
+          <a href="../swa-replay/">SWA 回放</a>
+          <a href="../engram-offload/" aria-current="page">Engram 卸载</a>
+        </nav>
+        <div class="topbar-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换配色">☾</button>
+          <a class="ghost-link" href="https://github.com/xLLM-AI/xllm" target="_blank" rel="noreferrer">xllm ↗</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero">
+        <div class="shell">
+          <p class="eyebrow">05 / 显存换带宽 · DeepSeek-V4.1</p>
+          <h1>Engram 主机侧卸载：把 27.7 GiB 的查表参数搬出 HBM</h1>
+          <p class="hero-lede">
+            Engram 是 V4.1 把「记住静态知识」从层计算里拆出来做成的查表模块。它的表很大，
+            在 W8A8 导出下<strong>每卡约 27.7 GiB 常驻显存</strong>。但查哪些表项<strong>只取决于输入 token</strong>，
+            可以提前算出来 —— 所以这张表可以放在 host 内存里，每步只把命中的那些行搬回设备。
+          </p>
+          <ul class="chips">
+            <li class="chip chip-good">已实现</li>
+            <li class="chip chip-warn">默认关闭 · 需显式传参</li>
+            <li class="chip chip-info">仅 int8 表</li>
+          </ul>
+        </div>
+      </section>
+
+      <div class="shell doc">
+        <div class="doc-main">
+          <section class="section" id="tldr">
+            <span class="section-number">01</span>
+            <h2>一句话结论与适用条件</h2>
+
+            <div class="summary">
+              <div>
+                <dt>解决什么问题</dt>
+                <dd>Engram 的 int8 表每卡占约 27.7 GiB HBM。这部分显存本可以留给 KV cache 或更大的 batch。</dd>
+              </div>
+              <div>
+                <dt>做了什么</dt>
+                <dd>表搬到 host 内存（可分页），每步做一次 NPU→CPU 的 id 同步 + 融合 CPU 算子查表去量化 + 命中行 H2D 回传。</dd>
+              </div>
+              <div>
+                <dt>换到了什么</dt>
+                <dd>换来 HBM 预算。代价是每步多出 host 侧的查表与一次 H2D，以及对 host 内存的占用。</dd>
+              </div>
+              <div>
+                <dt>什么时候别开</dt>
+                <dd>非 int8 表（fp8 / bf16 会回退到 HBM）、HBM 本来就够用、host 内存紧张、PP 或 DCP 不等于 1。</dd>
+              </div>
+            </div>
+
+            <div class="callout callout-info">
+              <span class="callout-label">为什么能提前预取</span>
+              Engram 的查表 id 是对输入 token 取 n-gram 再哈希得到的，<strong>不依赖任何层的计算结果</strong>。
+              所以进层之前就能把 id 算好，表的访问可以和前面的计算重叠。这是整个卸载方案成立的前提。
+            </div>
+          </section>
+
+          <section class="section wide" id="mechanism">
+            <span class="section-number">02</span>
+            <h2>机制：每一步发生什么</h2>
+
+            <figure>
+              <svg viewBox="0 0 860 280" role="img" aria-label="Engram 卸载的每步流程：设备算哈希 id，D2H 到锁页缓冲，CPU 融合算子查表去量化，再 H2D 回设备暂存块" class="dg">
+                <rect class="dg-box-accent" x="16" y="40" width="150" height="66" rx="6" />
+                <text class="dg-t" x="91" y="64" text-anchor="middle">设备：算哈希 id</text>
+                <text class="dg-t-sm" x="91" y="84" text-anchor="middle">只依赖输入 token</text>
+                <text class="dg-t-sm" x="91" y="98" text-anchor="middle">进层前即可完成</text>
+
+                <path class="dg-line-accent" d="M170 73 h36" /><path class="dg-fill-accent" d="M208 73 l-9 -5 v10 z" />
+                <text class="dg-t-sm" x="188" y="62" text-anchor="middle">D2H</text>
+
+                <rect class="dg-box" x="212" y="40" width="150" height="66" rx="6" />
+                <text class="dg-t" x="287" y="64" text-anchor="middle">锁页 host 缓冲</text>
+                <text class="dg-t-sm" x="287" y="84" text-anchor="middle">id 落到 pinned buffer</text>
+
+                <path class="dg-line-accent" d="M366 73 h36" /><path class="dg-fill-accent" d="M404 73 l-9 -5 v10 z" />
+
+                <rect class="dg-box-good" x="408" y="28" width="206" height="90" rx="6" />
+                <text class="dg-t" x="511" y="52" text-anchor="middle">CPU 融合算子</text>
+                <text class="dg-t-mono" x="511" y="72" text-anchor="middle">engram_int8_lookup_cpu</text>
+                <text class="dg-t-sm" x="511" y="92" text-anchor="middle">index_select + 分组 scale</text>
+                <text class="dg-t-sm" x="511" y="108" text-anchor="middle">+ bf16 转换，一次写入 staging</text>
+
+                <path class="dg-line-accent" d="M618 73 h36" /><path class="dg-fill-accent" d="M656 73 l-9 -5 v10 z" />
+                <text class="dg-t-sm" x="636" y="62" text-anchor="middle">H2D</text>
+
+                <rect class="dg-box-amber" x="660" y="40" width="184" height="66" rx="6" />
+                <text class="dg-t" x="752" y="64" text-anchor="middle">设备 staging 块</text>
+                <text class="dg-t-sm" x="752" y="84" text-anchor="middle">地址固定，被 ACL 图烘焙</text>
+
+                <rect class="dg-box-dim" x="16" y="140" width="828" height="56" rx="6" />
+                <text class="dg-t" x="32" y="162">表本身放可分页 host 内存；只有 staging / scratch 缓冲是锁页的</text>
+                <text class="dg-t-sm" x="32" y="182">整个查表过程是<tspan class="dg-t-key"> 图外的 host staging pass</tspan>，不是图安全的 host 工作，绝不能移进 ACL 图捕获</text>
+
+                <rect class="dg-box-dim" x="16" y="208" width="828" height="56" rx="6" />
+                <text class="dg-t" x="32" y="230">不开卸载时（默认）</text>
+                <text class="dg-t-sm" x="32" y="250">表常驻 HBM，走原来的设备查表路径，没有 D2H / CPU / H2D 这一串</text>
+              </svg>
+              <figcaption>
+                融合算子把「index_select + repeat_interleave 分组 scale + bf16 转换」合成一次 CPU 调用，
+                直接写进锁页 staging 缓冲。它是卸载路径<strong>唯一</strong>的去量化实现 —— 没注册就直接报错，不会静默退回逐算子的 host 路径。
+              </figcaption>
+            </figure>
+
+            <h3>DP 共享：共享的是表，不是查表结果</h3>
+            <p>
+              开 <code>dp_shared_memory</code> 后，同一节点内映射同一 TP 分片的 DP 副本共用<strong>一份物理 host 表</strong>，
+              而不是每个 rank 各存一份（每 rank 约省 27.7 GB host 内存）。
+            </p>
+            <p>
+              共享的是<strong>只读的 TP 分片表数据</strong>（host 上的 int8 codes 与 fp32 scales），
+              <strong>lookup 仍然每个 rank 各执行一次</strong>。原因很直接：各 rank 的输入与历史不同，生成的 n-gram hash id 本来就不一样；
+              要共享查表结果，就得先把 id 汇总到一处再广播回来，多出一轮通信与同步。所以设计上让每个 rank 直接查本地那份共享表。
+            </p>
+
+            <h4>共享段怎么建起来</h4>
+            <p>
+              vllm-ascend 用 CANN 注册的 UVA 区（<code>SharedUvaBuffer</code>）做这件事；xLLM 在 CPU 上读表，
+              所以去掉了设备指针 / host 注册那一层，机制就是普通的 <code>multiprocessing.shared_memory</code> 段
+              加一个 <code>torch.frombuffer</code> 的 CPU 视图。每个「(engram 层, TP 分片)」拥有两个段：
+              <code>codes</code>（<code>[rows, dim]</code> int8）和 <code>scales</code>（<code>[rows, dim // quant_block]</code> float32）。
+            </p>
+            <ol class="steps">
+              <li><h4>leader 创建</h4><p>组内 rank 0 用随机名建两个段。</p></li>
+              <li><h4>广播描述符</h4><p>通过 gloo 组广播名称 / shape / dtype / size / 层 id / TP 分片 / leader 全局 rank / 随机 token。</p></li>
+              <li><h4>非 leader attach 并校验</h4><p>校验 size、shape、dtype 和 token，然后各自建 CPU 视图。</p></li>
+              <li><h4>收集错误并栅栏</h4><p><code>engram_all_gather_object</code> 收集每个 rank 的错误，<code>engram_barrier</code> 给所有映射（或所有失败）加栅栏。</p></li>
+              <li><h4>leader unlink</h4><p>leader 删掉两个名字，自己和所有 attacher 的映射仍然有效。此时状态才是 ATTACHED，leader 单独加载后转 LOADED。</p></li>
+            </ol>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">hostname 不是共享成功的证据</span>
+              <code>hostname</code> 只用于预检分组（比如估算 <code>/dev/shm</code> 容量）。不同物理节点必须可区分；
+              但同一物理机上处于不同 <code>/dev/shm</code> namespace 的容器（各自挂独立 tmpfs）同样不能共享。
+              真正的证据是 <strong>attach 成功，并且从段尾读回的 token 与 leader 写入的一致</strong>（<code>_verify_segment_token</code>）。
+              <code>/dev/shm</code> 容量检查同样只是预检。这里<strong>不要求</strong>每个 rank 的 hostname 唯一 —— 同节点多 rank 重名是正常的。
+            </div>
+          </section>
+
+          <section class="section wide" id="enable">
+            <span class="section-number">03</span>
+            <h2>配置方式</h2>
+
+            <p>
+              配置以<strong>原始 JSON 字符串</strong>经 C++ gflag <code>engram_config</code> 透传到 Python 执行器解析，
+              命令行参数写作 <code>--engram-config</code>：
+            </p>
+            <pre><code>xllm --engram-config '{"cpu_offload":true,"dp_shared_memory":false}'</code></pre>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>键</th><th>默认</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td><code>cpu_offload</code></td><td><code>false</code></td><td>int8 Engram 表驻留 host 内存（卸载开关）</td></tr>
+                  <tr><td><code>dp_shared_memory</code></td><td><code>false</code></td><td>节点内 DP 副本共享同一份 host 表。<b>lookup 仍每 rank 各执行一次</b></td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">默认是全关</span>
+              不传 <code>--engram-config</code> 时 <code>EngramConfig()</code> 为 <code>{"cpu_offload":false,"dp_shared_memory":false}</code>（等价 <code>{}</code>），
+              走 HBM 路径。要开启卸载<strong>必须显式传入</strong>。部署侧的启动脚本若需要默认开启，由该脚本自行下发参数，xLLM 不感知其形态。
+            </div>
+
+            <h3>合法与非法组合</h3>
+            <pre><code>// 合法，三选一
+{}                                              // 全关：走 HBM 路径
+{"cpu_offload": true}                           // 卸载到 host 内存
+{"cpu_offload": true, "dp_shared_memory": true} // 卸载 + 节点内 DP 共享 host 表
+
+// 非法，解析期直接 ValueError
+{"dp_shared_memory": true}                       // shared 必须配 cpu_offload
+{"cpu_offload": false, "dp_shared_memory": true} // 同上</code></pre>
+
+            <div class="callout callout-info">
+              <span class="callout-label">解析是严格的</span>
+              字段值必须是真正的布尔值，<code>"true"</code> / <code>0</code> / <code>1</code> 一律拒绝；
+              未知字段、重复 JSON key、非法 JSON 都会报错。设计意图很明确：
+              <strong>一个拼写错误不能静默地把开关关掉</strong>。
+            </div>
+          </section>
+
+          <section class="section wide" id="limits">
+            <span class="section-number">04</span>
+            <h2>约束</h2>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>项</th><th>要求</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>TP</b></td>
+                    <td>
+                      仅支持 <code>TP ∈ {1, 2, 4, 8}</code>，且 <strong>hash 列数必须被 TP 整除</strong>。
+                      hash 列数 = <code>(max_ngram_size - 1) × n_heads</code>；V4.1 默认 <code>n_heads=8</code>、<code>max_ngram_size=4</code> ⇒ <b>24 列</b>，
+                      TP 取 1/2/4/8 均整除。非整除的去量化 / 切分会直接拒绝。
+                    </td>
+                  </tr>
+                  <tr><td><b>PP / DCP</b></td><td>目前要求 <code>PP = 1</code>、<code>DCP = 1</code></td></tr>
+                  <tr><td><b>权重格式</b></td><td>仅 safetensors / dummy（<code>load_format ∈ {auto, safetensors, dummy}</code>）</td></tr>
+                  <tr>
+                    <td><b>量化类型</b></td>
+                    <td>
+                      <strong>int8 专属</strong>。只有 W8A8（int8）表有 CPU 解码路径；
+                      fp8 / bf16 表请求 <code>cpu_offload</code> 会<strong>回退到 HBM</strong>，请求 <code>dp_shared_memory</code> 则<strong>直接报错</strong>。
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><b>DP 共享依赖</b></td>
+                    <td>需要节点内 gloo 通信组（HCCL 没有 object 集合通信）与 <code>/dev/shm</code> 空间（启动前按聚合 footprint 预检）</td>
+                  </tr>
+                  <tr>
+                    <td><b>PD 分离</b></td>
+                    <td><span class="chip chip-warn">TODO</span> 待 V4.1 Engram 接入 P/D 分离拓扑后，该拓扑将要求 <code>dp_shared_memory=true</code>；当前运行期尚未强制</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="section wide" id="evidence">
+            <span class="section-number">05</span>
+            <h2>代码证据</h2>
+            <div class="evidence">
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>位置</th><th>负责什么</th></tr></thead>
+                  <tbody>
+                    <tr><td>xllm/python/models/engram_config.py</td><td>严格解析与校验 <code>--engram-config</code>，是这份 JSON 的唯一解码点</td></tr>
+                    <tr><td>xllm/python/models/deepseek_v41_engram.py</td><td>卸载路径：staging 缓冲管理、融合 CPU 算子调用、图可见 staging 块的地址约束</td></tr>
+                    <tr><td>xllm/python/models/engram_shared_memory.py</td><td>DP 共享 host 表：段的创建 / 广播 / attach / 校验 / unlink</td></tr>
+                    <tr><td>xllm/python/models/deepseek_v41.py</td><td><code>_validate_engram_config</code>：TP、PP/DCP、权重格式、量化类型的校验</td></tr>
+                    <tr><td>core/kernels/npu/xllm_ops/engram_int8_lookup_cpu.cpp</td><td>融合 CPU 查表去量化算子的实现</td></tr>
+                    <tr><td>core/framework/config/model_config.h</td><td><code>engram_config</code> 的 gflag 定义，默认 <code>"{}"</code></td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="section wide" id="numbers">
+            <span class="section-number">06</span>
+            <h2>收益与验证强度</h2>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>项</th><th>状态</th><th>说明</th></tr></thead>
+                <tbody>
+                  <tr><td>HBM 释放量</td><td><span class="chip chip-good">有明确口径</span></td><td>W8A8（Eco-Tech int8）导出下每卡约 <b>27.7 GiB</b></td></tr>
+                  <tr><td>host 内存节省</td><td><span class="chip chip-good">有明确口径</span></td><td>开 <code>dp_shared_memory</code> 后每 rank 约省 <b>27.7 GB</b> host 内存</td></tr>
+                  <tr><td>时延代价</td><td><span class="chip chip-warn">未量化</span></td><td>每步多一次 D2H id 同步 + CPU 查表 + 命中行 H2D，具体占多少未实测</td></tr>
+                  <tr><td>端到端吞吐影响</td><td><span class="chip chip-warn">未验证</span></td><td>本页不给数字</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="callout callout-info">
+              <span class="callout-label">怎么判断值不值得开</span>
+              这是一个<strong>拿时延换显存</strong>的开关，不是纯收益。判断方法：先算开了之后多出来的 HBM 能让
+              KV cache 容量 / 并发涨多少，再在目标负载上 A/B 测时延代价。
+              如果多出来的显存并没有转化成更大的 batch 或更长的上下文，那就不该开。
+            </div>
+          </section>
+
+          <section class="section" id="risk">
+            <span class="section-number">07</span>
+            <h2>风险与待确认</h2>
+            <ul>
+              <li><strong>融合算子必须编进二进制</strong>：<code>torch.ops.xllm_ops.engram_int8_lookup_cpu</code> 没注册就直接报错，提示重新编译 / 安装。它是卸载路径唯一的去量化实现。</li>
+              <li><strong>不能移进 ACL 图</strong>：host staging pass 不是图安全的。设备 staging 块的地址在捕获时被烘焙进图，之后不能再移动或增长；图可见的那块按最大 bucket 预先分配。</li>
+              <li><strong>锁页失败要当真</strong>：锁页 staging 分配不到时会报出真实原因，而不是悄悄退化成未锁页的 staging。</li>
+              <li><strong>容器与 /dev/shm</strong>：同机不同 namespace 的容器无法共享，预检通过不等于共享成功（见<a href="#mechanism">第 2 节</a>）。</li>
+              <li><strong>PD 分离尚未收口</strong>：接入后会要求 <code>dp_shared_memory=true</code>，当前未强制。</li>
+            </ul>
+          </section>
+
+          <nav class="pager" aria-label="相邻页面">
+            <a href="../swa-replay/"><span>上一页</span><b>← SWA Bounded Replay</b></a>
+            <a href="../arch/"><span>相关背景</span><b>Engram 在模型里是什么 →</b></a>
+          </nav>
+        </div>
+
+        <aside class="toc" aria-label="本页目录">
+          <p>本页目录</p>
+          <ol>
+            <li><a href="#tldr">结论与适用条件</a></li>
+            <li><a href="#mechanism">机制</a></li>
+            <li><a href="#enable">配置方式</a></li>
+            <li><a href="#limits">约束</a></li>
+            <li><a href="#evidence">代码证据</a></li>
+            <li><a href="#numbers">收益与验证强度</a></li>
+            <li><a href="#risk">风险与待确认</a></li>
+          </ol>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell">
+        <p><a href="../">← 回到特性列表</a></p>
+        <p>这是一个拿时延换显存的开关。开启前先确认多出来的 HBM 能转化成实际收益。</p>
+      </div>
+    </footer>
+  </body>
+</html>

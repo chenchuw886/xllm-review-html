@@ -3,410 +3,326 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DSpark｜xLLM 特性解读</title>
     <meta
       name="description"
-      content="xLLM DSpark 特性解读：理解主流投机解码、半自回归块草稿、训练方法、收益边界与 DeepSeek-V4-Flash-0731 使用方式。"
+      content="xLLM DSpark 投机解码：块并行草稿 + Markov 条件头 + 置信度头。讲清一次 decode step 的时序、逐位置接受率、两套 KV 缓存，以及当前实现的边界。"
     />
-    <meta name="theme-color" content="#0b0c18" />
-    <title>xLLM DSpark｜一次起草 5 个，一把校验</title>
-    <link rel="stylesheet" href="../flashcomm/styles.css" />
-    <link rel="stylesheet" href="./styles.css" />
-    <script defer src="./app.js"></script>
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script defer src="../assets/site.js"></script>
   </head>
-  <body class="dspark-page">
+  <body>
     <a class="skip-link" href="#main">跳到正文</a>
 
     <header class="topbar">
-      <a class="brand" href="../" aria-label="返回特性首页">
-        <span class="brand-mark" aria-hidden="true">x</span>
-        <span>xLLM / Feature Review</span>
-      </a>
-      <nav class="topnav" aria-label="页面导航">
-        <a href="#basics">投机解码</a>
-        <a href="#landscape">方案对比</a>
-        <a href="#inside">DSpark 原理</a>
-        <a href="#evidence">实测收益</a>
-        <a href="#fit">适用边界</a>
-        <a href="#start">使用</a>
-      </nav>
-      <a
-        class="source-link"
-        href="https://github.com/xLLM-AI/xllm/pull/2172"
-        target="_blank"
-        rel="noreferrer"
-      >PR #2172 ↗</a>
+      <div class="shell topbar-inner">
+        <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">x</span>xLLM / Feature Review</a>
+        <nav class="topnav" aria-label="特性导航">
+          <a href="../">首页</a>
+          <a href="../arch/">V4.1 架构</a>
+          <a href="../flashcomm/">FlashComm</a>
+          <a href="../dspark/" aria-current="page">DSpark</a>
+          <a href="../dsa-cp/">DSA CP</a>
+          <a href="../swa-replay/">SWA 回放</a>
+          <a href="../engram-offload/">Engram 卸载</a>
+        </nav>
+        <div class="topbar-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换配色">☾</button>
+          <a class="ghost-link" href="https://github.com/xLLM-AI/xllm" target="_blank" rel="noreferrer">xllm ↗</a>
+        </div>
+      </div>
     </header>
 
     <main id="main">
-      <section class="hero dspark-hero" id="top" aria-labelledby="hero-title">
-        <div class="hero-glow hero-glow-a" aria-hidden="true"></div>
-        <div class="hero-glow hero-glow-b" aria-hidden="true"></div>
-        <div class="hero-copy">
-          <p class="eyebrow"><span></span>xLLM · SPECULATIVE DECODING · DSV4</p>
-          <h1 id="hero-title">D<span>Spark</span></h1>
-          <p class="hero-line">一次起草 5 个，一把交给大模型校验。</p>
-          <p class="hero-desc">
-            重计算的草稿主干并行生成整块候选，轻量 Markov head 再补上块内依赖。
-            多个 token 能在一次 target forward 中被接受，Decode 因此走得更快。
+      <section class="hero">
+        <div class="shell">
+          <p class="eyebrow">02 / Decode · 投机解码</p>
+          <h1>DSpark：一次起草一整块，一把交给大模型校验</h1>
+          <p class="hero-lede">
+            普通投机解码的草稿模型要串行跑 γ 次才能起草 γ 个 token。DSpark 用一个并行 backbone
+            <strong>一次前向就算出块内全部位置</strong>，再用两个极轻的头把「后一个词依赖前一个词」这件事补回来。
+            目标模型随后只做一次校验。
           </p>
-          <div class="hero-actions">
-            <a class="button button-primary" href="#basics">60 秒看懂</a>
-            <a class="button button-ghost" href="#evidence">看 Atlas A3 实测</a>
-          </div>
-        </div>
-
-        <div class="spec-console" aria-label="DSpark 一轮草稿与校验示意图">
-          <div class="console-head">
-            <span>DECODE ROUND</span>
-            <span class="live-dot">LOSSLESS VERIFY</span>
-          </div>
-
-          <div class="context-line">
-            <span class="context-label">已确认上下文</span>
-            <div class="context-tokens" aria-hidden="true">
-              <i>…</i><i>A</i><i>B</i><i class="anchor">D</i>
-            </div>
-          </div>
-
-          <div class="draft-machine">
-            <div class="machine-label">
-              <span>PARALLEL BACKBONE</span>
-              <b>1 × forward</b>
-            </div>
-            <div class="draft-slots" aria-label="五个并行草稿位置">
-              <div><small>pos 0</small><strong>E</strong><em>83.9%</em></div>
-              <div><small>pos 1</small><strong>F</strong><em>74.4%</em></div>
-              <div><small>pos 2</small><strong>G</strong><em>65.7%</em></div>
-              <div><small>pos 3</small><strong>H</strong><em>59.8%</em></div>
-              <div><small>pos 4</small><strong>I</strong><em>54.7%</em></div>
-            </div>
-            <div class="markov-rail" aria-hidden="true">
-              <span>D</span><b>→</b><span>E</span><b>→</b><span>F</span><b>→</b><span>G</span><b>→</b><span>H</span><b>→</b><span>I</span>
-            </div>
-            <p><span>MARKOV HEAD</span> 前一个已采样 token，为下一个位置补一份低秩转移偏置</p>
-          </div>
-
-          <div class="verify-line">
-            <span>TARGET 验证</span>
-            <div class="verify-tokens" aria-label="前三个 token 接受、第四个 token 拒绝">
-              <i class="accepted">E ✓</i><i class="accepted">F ✓</i><i class="accepted">G ✓</i><i class="rejected">H ×</i><i class="discarded">I</i>
-            </div>
-            <b>提交 E F G + 校正 token</b>
-          </div>
-        </div>
-
-        <div class="hero-metrics" aria-label="核心实测结论">
-          <div><strong>−60.1%</strong><span>并发 32 TPOT vs baseline</span></div>
-          <div><strong>3.39</strong><span>平均接受 draft tokens / round</span></div>
-          <div><strong>γ = 5</strong><span>0731 checkpoint 训练块宽</span></div>
+          <ul class="chips">
+            <li class="chip chip-good">已实现</li>
+            <li class="chip chip-good">A3 单机已实测</li>
+            <li class="chip chip-info">Decode / 长输出优化</li>
+          </ul>
         </div>
       </section>
 
-      <section class="section" id="basics">
-        <div class="section-heading">
-          <p class="kicker">01 / THE IDEA</p>
-          <h2>为什么能快：把“逐个生成”改成<strong>批量猜、一次验</strong></h2>
-          <p>大模型每次只生成一个 token，Decode 会反复读完整模型权重。投机解码先让更便宜的 drafter 猜一段，再由 target 并行验证；验收规则保证最终仍服从 target 分布。</p>
-        </div>
+      <div class="shell doc">
+        <div class="doc-main">
+          <section class="section" id="tldr">
+            <span class="section-number">01</span>
+            <h2>一句话结论与适用条件</h2>
 
-        <div class="round-compare">
-          <article class="round-card baseline-round">
-            <div class="round-top"><span>普通自回归</span><em>5 TOKENS</em></div>
-            <h3>大模型要走 5 次</h3>
-            <div class="serial-steps" aria-label="五次串行 target forward">
-              <span>T<sub>1</sub></span><b>→</b><span>T<sub>2</sub></span><b>→</b><span>T<sub>3</sub></span><b>→</b><span>T<sub>4</sub></span><b>→</b><span>T<sub>5</sub></span>
-            </div>
-            <p>每一步都依赖上一步结果，无法把未来 token 直接并到一次 forward。</p>
-          </article>
-          <article class="round-card speculative-round">
-            <div class="round-top"><span>投机解码</span><em>DRAFT + VERIFY</em></div>
-            <h3>便宜地猜一块，大模型验一次</h3>
-            <div class="parallel-steps" aria-label="一次草稿与一次 target 验证">
-              <span class="draft-pill">draft × 5</span><b>→</b><span class="verify-pill">target verify × 1</span><b>→</b><span class="commit-pill">提交最长前缀</span>
-            </div>
-            <p>收益取决于三个量：草稿够不够快、一次能接受多长、target 有没有验证太多注定被拒的尾部。</p>
-          </article>
-        </div>
-
-        <div class="formula-strip">
-          <span>平均每 token 延迟</span>
-          <b>=</b>
-          <span>草稿耗时 + 验证耗时</span>
-          <b>÷</b>
-          <strong>每轮提交 token 数</strong>
-        </div>
-      </section>
-
-      <section class="section landscape-section" id="landscape">
-        <div class="section-heading">
-          <p class="kicker">02 / LANDSCAPE</p>
-          <h2>主流方案，差别都在<strong>怎么猜下一段</strong></h2>
-          <p>点击方案看取舍。没有一种 drafter 永远占优：更强的依赖建模通常意味着更高的起草开销，更激进的并行又容易让块尾质量下滑。</p>
-        </div>
-
-        <div class="method-explorer" data-method-explorer>
-          <div class="method-tabs" role="tablist" aria-label="投机解码方案">
-            <button class="method-tab active" type="button" role="tab" aria-selected="true" data-method="draft">小 Draft Model</button>
-            <button class="method-tab" type="button" role="tab" aria-selected="false" data-method="mtp">MTP / Medusa</button>
-            <button class="method-tab" type="button" role="tab" aria-selected="false" data-method="eagle">EAGLE</button>
-            <button class="method-tab" type="button" role="tab" aria-selected="false" data-method="dflash">DFlash</button>
-            <button class="method-tab dspark-tab" type="button" role="tab" aria-selected="false" data-method="dspark">DSpark</button>
-          </div>
-          <article class="method-detail" data-method-detail aria-live="polite">
-            <div class="method-icon" data-method-icon>AR</div>
-            <div>
-              <p data-method-kicker>经典方案</p>
-              <h3 data-method-title>小模型自回归起草</h3>
-              <p data-method-copy>用同 tokenizer 的小模型逐个生成候选。通用、容易理解，但草稿长度 γ 越大，起草也要串行多走几步。</p>
-            </div>
-            <dl>
-              <div><dt>起草并行度</dt><dd data-method-parallel>低 · 随 γ 线性增长</dd></div>
-              <div><dt>块内依赖</dt><dd data-method-dependency>强 · 完整自回归</dd></div>
-              <div><dt>主要代价</dt><dd data-method-cost>额外模型显存与串行 draft latency</dd></div>
-            </dl>
-          </article>
-        </div>
-
-        <div class="landscape-axis" aria-label="方案在并行起草和块内依赖之间的位置">
-          <span>更强块内依赖</span>
-          <div class="axis-track">
-            <i class="point p-draft"><b>Draft</b></i>
-            <i class="point p-eagle"><b>EAGLE</b></i>
-            <i class="point p-dspark"><b>DSpark</b></i>
-            <i class="point p-mtp"><b>MTP</b></i>
-            <i class="point p-dflash"><b>DFlash</b></i>
-          </div>
-          <span>更高起草并行度</span>
-        </div>
-      </section>
-
-      <section class="section" id="inside">
-        <div class="section-heading">
-          <p class="kicker">03 / INSIDE DSPARK</p>
-          <h2>DSpark：重活并行做，依赖<strong>轻量补回来</strong></h2>
-          <p>DeepSeek-V4-Flash-0731 的 xLLM 路径使用 3 层并行 drafter 和 rank-256 Markov head。前者一次算完整块，后者只做很轻的逐位采样。</p>
-        </div>
-
-        <div class="architecture-card">
-          <div class="architecture-head">
-            <div><span>xLLM CURRENT PATH</span><b>固定 γ=5 的半自回归草稿 + target 并行校验</b></div>
-            <em>DEEPSEEK-V4-FLASH-0731</em>
-          </div>
-          <div class="architecture-flow" aria-label="xLLM DSpark 模型数据流">
-            <article class="arch-step target-step">
-              <span>01 · TARGET CONTEXT</span>
-              <b>Layer 40 / 41 / 42</b>
-              <p>抽取 target 隐状态</p>
-              <small>rich context features</small>
-            </article>
-            <div class="arch-connector"><i></i><span>拼接 + 投影</span></div>
-            <article class="arch-step parallel-step">
-              <span>02 · PARALLEL</span>
-              <b>3-layer MoE + SWA</b>
-              <p>一次 forward 得到 5 组 base logits</p>
-              <small>U₁ · U₂ · U₃ · U₄ · U₅</small>
-            </article>
-            <div class="arch-connector"><i></i><span>逐位加 bias</span></div>
-            <article class="arch-step markov-step">
-              <span>03 · SEQUENTIAL</span>
-              <b>Low-rank Markov</b>
-              <p>只依赖前一个已采样 token</p>
-              <small>Uₖ + W₁[xₖ₋₁]W₂</small>
-            </article>
-            <div class="arch-connector"><i></i><span>draft block</span></div>
-            <article class="arch-step verify-step">
-              <span>04 · TARGET VERIFY</span>
-              <b>1 parallel pass</b>
-              <p>接受最长前缀并给出校正 token</p>
-              <small>exact target distribution</small>
-            </article>
-          </div>
-        </div>
-
-        <div class="two-layer-design">
-          <article>
-            <div class="design-tag parallel-tag">并行主干</div>
-            <h3>先把 5 个位置一起算出来</h3>
-            <p>块内位置彼此可见，并共享从 target 注入的上下文 KV。主计算量几乎不随每个位置串行叠加。</p>
-            <div class="micro-visual parallel-micro"><i></i><i></i><i></i><i></i><i></i></div>
-          </article>
-          <article>
-            <div class="design-tag markov-tag">Markov head</div>
-            <h3>再让后一个 token 看见前一个</h3>
-            <p>低秩词表转移矩阵为每步 logits 加 bias，缓解纯并行 drafter 常见的语义分叉与尾部衰减。</p>
-            <div class="micro-visual markov-micro"><i></i><b>→</b><i></i><b>→</b><i></i><b>→</b><i></i><b>→</b><i></i></div>
-          </article>
-        </div>
-
-        <div class="paper-scope">
-          <div>
-            <span>论文中的完整 DSpark</span>
-            <b>半自回归 drafter</b><i>+</i><b>confidence head</b><i>+</i><b>硬件感知前缀调度</b>
-          </div>
-          <p><strong>xLLM 当前范围：</strong>已消费并行主干和 Markov head，按固定 5-token 块校验；checkpoint 中的 confidence head 与负载感知动态校验长度尚未接入。</p>
-        </div>
-      </section>
-
-      <section class="section training-section" id="training">
-        <div class="section-heading">
-          <p class="kicker">04 / TRAINING</p>
-          <h2>怎么训：冻结 target，专门训练一个<strong>会被接受的 drafter</strong></h2>
-          <p>训练目标不是独立成为更好的小语言模型，而是尽可能贴近 target 的条件分布，让更长前缀通过验证。</p>
-        </div>
-
-        <div class="training-pipeline">
-          <article><span>01</span><b>Target 生成数据</b><p>从序列中随机采样 anchor，组成 γ-token 训练块。</p></article>
-          <article><span>02</span><b>冻结大模型</b><p>target、词表 embedding 和 LM head 保持冻结。</p></article>
-          <article><span>03</span><b>训练三部分</b><p>并行 backbone、Markov/RNN 顺序模块、confidence head。</p></article>
-          <article><span>04</span><b>校准置信度</b><p>用 STS 校准前缀存活概率，供完整方案动态裁剪验证长度。</p></article>
-        </div>
-
-        <div class="loss-board">
-          <div class="loss-title"><span>TRAINING OBJECTIVE</span><b>越靠前的位置权重越高</b></div>
-          <div class="loss-items">
-            <article><strong>CE</strong><span>预测真值 token</span><p>学会“说对”</p></article>
-            <i>+</i>
-            <article><strong>TV</strong><span>贴近 target 分布</span><p>直接优化可接受概率</p></article>
-            <i>+</i>
-            <article><strong>CONF</strong><span>预测 token 能否存活</span><p>服务于动态调度</p></article>
-          </div>
-          <p>DeepSeek-V4 部署版配置：3 层 MoE drafter、SWA 128、最大块宽 5、Markov rank 256。</p>
-        </div>
-      </section>
-
-      <section class="section evidence-section" id="evidence">
-        <div class="section-heading">
-          <p class="kicker">05 / EVIDENCE</p>
-          <h2>实测：长输出 Decode 收益<strong>非常直接</strong></h2>
-          <p>同一组约 8K 输入、1K 输出 workload，Atlas A3 单机 16 卡、DP4。下面展示并发 32 的平均结果。</p>
-        </div>
-
-        <div class="performance-layout">
-          <div class="perf-card">
-            <div class="perf-head"><h3>平均 TPOT</h3><span>ms · 越低越好</span></div>
-            <div class="perf-row">
-              <div><b>Baseline</b><span>70.1 ms</span></div>
-              <div class="perf-track"><i class="perf-bar baseline-perf" style="--bar: 100%"></i></div>
-            </div>
-            <div class="perf-row">
-              <div><b>MTP · γ=1</b><span>45.1 ms</span></div>
-              <div class="perf-track"><i class="perf-bar mtp-perf" style="--bar: 64.3%"></i></div>
-            </div>
-            <div class="perf-row">
-              <div><b>DSpark · γ=5</b><span>28.0 ms</span></div>
-              <div class="perf-track"><i class="perf-bar dspark-perf" style="--bar: 39.9%"></i></div>
-            </div>
-            <div class="perf-result"><strong>−60.1%</strong><span>vs baseline</span><i>输出吞吐 422.95 → 845.74 tok/s</i></div>
-          </div>
-
-          <div class="accept-card" data-accept-card>
-            <div class="accept-head">
-              <div><h3>块内接受表现</h3><span>30K in / 1K out × 4</span></div>
-              <div class="metric-toggle" role="group" aria-label="接受率口径">
-                <button class="active" type="button" data-accept-mode="survival">前缀存活率</button>
-                <button type="button" data-accept-mode="conditional">条件接受率</button>
+            <div class="summary">
+              <div>
+                <dt>解决什么问题</dt>
+                <dd>decode 阶段每步只产出 1 个 token，但每步都要把整个 MoE 大模型跑一遍。算力利用率低，TPOT 被访存和下发开销主导。</dd>
+              </div>
+              <div>
+                <dt>做了什么</dt>
+                <dd>用一个 3 层的轻量草稿模型一次起草 5 个 token，目标模型一次校验这一整块，接受最长的合法前缀，并顺带拿到一个 bonus token。</dd>
+              </div>
+              <div>
+                <dt>什么时候开</dt>
+                <dd>decode 占端到端时延比例高的场景：长输出、中低并发。接受率越高，收益越大。</dd>
+              </div>
+              <div>
+                <dt>什么时候别开</dt>
+                <dd>短输出（起草开销摊不回来）、prefill 主导的场景。在我们的实测里 <strong>DSpark 会抬高 TTFT</strong>，它不是端到端无条件的赢。</dd>
               </div>
             </div>
-            <div class="accept-bars" aria-live="polite">
-              <div><span>pos 0</span><i><b data-accept-bar style="--value: 83.9%"></b></i><em data-accept-value>83.9%</em></div>
-              <div><span>pos 1</span><i><b data-accept-bar style="--value: 74.4%"></b></i><em data-accept-value>74.4%</em></div>
-              <div><span>pos 2</span><i><b data-accept-bar style="--value: 65.7%"></b></i><em data-accept-value>65.7%</em></div>
-              <div><span>pos 3</span><i><b data-accept-bar style="--value: 59.8%"></b></i><em data-accept-value>59.8%</em></div>
-              <div><span>pos 4</span><i><b data-accept-bar style="--value: 54.7%"></b></i><em data-accept-value>54.7%</em></div>
+
+            <div class="callout callout-info">
+              <span class="callout-label">三个层次不要混</span>
+              <p><strong>① 投机解码</strong>：一个无损的 draft-and-verify 算法，接受与目标分布一致的最长草稿前缀。</p>
+              <p><strong>② DSpark 论文的完整设计</strong>：半自回归块草稿 + 置信度调度的验证长度。</p>
+              <p><strong>③ xLLM 当前实现</strong>：固定 5 token 的块草稿（并行 backbone + 低秩 Markov 头）+ 目标模型校验。<strong>尚未加载 checkpoint 的置信度头，也没有实现论文的硬件感知前缀调度器。</strong>所以本页不把论文里在线调度带来的收益算到当前实测上。</p>
             </div>
-            <p data-accept-note>从整块起点观察，有 54.7% 的 proposal 能完整通过 5 个 draft token。</p>
-          </div>
-        </div>
+          </section>
 
-        <div class="accept-summary">
-          <article><span>67.7%</span><b>draft token 总接受率</b><p>3220 / 4755</p></article>
-          <article><span>3.39</span><b>平均接受 draft 长度</b><p>token / proposal</p></article>
-          <article><span>≈ 4.39</span><b>平均每轮提交</b><p>含 target bonus / correction</p></article>
-          <article><span>54.7%</span><b>完整 5-token 块</b><p>520 / 951 proposals</p></article>
-        </div>
+          <section class="section wide" id="step">
+            <span class="section-number">02</span>
+            <h2>一次 decode step：从 anchor 到下一个 anchor</h2>
 
-        <div class="benchmark-note dspark-benchmark-note">
-          <b>测试口径</b>
-          <span>DeepSeek-V4-Flash-0731 W8A8</span><span>Atlas A3 × 16</span><span>DP4</span><span>8K input</span><span>1K output</span><span>Concurrency 32</span>
-          <p>这是当前 xLLM 固定 γ=5 路径的一组参考结果，不等同于论文中启用 confidence scheduler 的线上数据。不同 prompt 分布、并发、输出长度和硬件会改变收益。</p>
-        </div>
-      </section>
+            <figure>
+              <svg viewBox="0 0 860 300" role="img" aria-label="DSpark 一次 decode step：anchor hidden 投影进草稿模型，并行 backbone 出 5 个位置的 base logits，Markov 头串行修正出草稿链，目标模型一次校验" class="dg">
+                <rect class="dg-box" x="16" y="44" width="116" height="62" rx="6" />
+                <text class="dg-t" x="74" y="68" text-anchor="middle">anchor</text>
+                <text class="dg-t-sm" x="74" y="86" text-anchor="middle">目标模型抽出的 hidden</text>
 
-      <section class="section" id="fit">
-        <div class="section-heading">
-          <p class="kicker">06 / WHEN IT WINS</p>
-          <h2>更适合长输出；不是每个请求都该<strong>无脑开启</strong></h2>
-          <p>投机解码用额外 draft 计算换更少的 target step。输出越长、接受越高，这笔账越容易赚回来。</p>
-        </div>
+                <path class="dg-line-accent" d="M132 75 h38" /><path class="dg-fill-accent" d="M172 75 l-9 -5 v10 z" />
 
-        <div class="fit-grid">
-          <article class="fit-card good-fit">
-            <span>收益更明确</span>
-            <h3>Decode 主导的长输出</h3>
+                <rect class="dg-box-accent" x="176" y="30" width="230" height="92" rx="6" />
+                <text class="dg-t" x="190" y="52">阶段 1 · 并行 Backbone（跑 1 次）</text>
+                <text class="dg-t-sm" x="190" y="72">3 层 SWA-MLA + MoE，window = 128</text>
+                <text class="dg-t-sm" x="190" y="88">块内 5 个位置互不 attend</text>
+                <text class="dg-t-key" x="190" y="110">→ h₁..h₅ 与 base logits L₁..L₅</text>
+
+                <path class="dg-line-accent" d="M406 75 h38" /><path class="dg-fill-accent" d="M446 75 l-9 -5 v10 z" />
+
+                <rect class="dg-box-good" x="450" y="30" width="236" height="92" rx="6" />
+                <text class="dg-t" x="464" y="52">阶段 2 · 串行轻量头</text>
+                <text class="dg-t-sm" x="464" y="72">Markov：zₖ = Lₖ + B(yₖ₋₁)，greedy</text>
+                <text class="dg-t-sm" x="464" y="88">只有查表 + gemv + add + argmax</text>
+                <text class="dg-t-key" x="464" y="110">→ 草稿链 y₁..y₅</text>
+
+                <path class="dg-line" d="M568 122 v34 h-300 v22" />
+                <path class="dg-fill-line" d="M268 182 l-5 -9 h10 z" />
+
+                <rect class="dg-box-amber" x="136" y="186" width="264" height="86" rx="6" />
+                <text class="dg-t" x="150" y="208">目标模型 verify（1 次前向）</text>
+                <text class="dg-t-sm" x="150" y="228">输入：anchor d₀ d₁ d₂ d₃ d₄</text>
+                <text class="dg-t-sm" x="150" y="244">预测：d₀ d₁ d₂ d₃ d₄ d₅</text>
+                <text class="dg-t-sm" x="150" y="262">每一行都预测下一个 token</text>
+
+                <path class="dg-line" d="M400 228 h46" /><path class="dg-fill-line" d="M448 228 l-9 -5 v10 z" />
+
+                <rect class="dg-box" x="452" y="186" width="234" height="86" rx="6" />
+                <text class="dg-t" x="466" y="208">接受最长合法前缀</text>
+                <text class="dg-t-sm" x="466" y="228">全对 → 末行预测是 <tspan class="dg-t-key">bonus</tspan></text>
+                <text class="dg-t-sm" x="466" y="246">中途错 → 该行预测是 <tspan class="dg-t-key">correction</tspan></text>
+                <text class="dg-t-sm" x="466" y="264">→ 新 anchor，进入下一轮</text>
+              </svg>
+              <figcaption>
+                correction 和 bonus 都来自 verify 的逐行预测，不是额外一次前向。所以一步提交的长度是
+                <code>接受的草稿数 + 1</code>。
+              </figcaption>
+            </figure>
+
+            <h3>两个轻量头</h3>
+            <p>
+              <strong>Markov 头</strong>（默认 rank 256）：用一个 token-到-token 转移矩阵的低秩分解给出偏置
+              <code>B(y) = W₁[y] @ W₂</code>。循环 k=1..5：查 <code>W₁</code> 得到 r 维向量，乘 <code>W₂</code> 得到词表长度的 bias，
+              加到 <code>Lₖ</code> 上后 greedy argmax。全程<strong>没有 attention、没有 KV 更新、没有 norm / MoE</strong>。
+            </p>
+            <p>
+              <strong>Confidence 头</strong>（论文设计）：输入当前位置 hidden 和上一个 token 的 Markov embedding，
+              concat 过线性层加 sigmoid，给出「在前面全部 accept 的前提下，第 k 个 token 能通过验证的概率」。
+              调度器据此提前截断验证长度，不去验证后面低置信的草稿。
+              <strong>xLLM 当前实现没有加载这个头，验证长度固定为 5。</strong>
+            </p>
+          </section>
+
+          <section class="section wide" id="kv">
+            <span class="section-number">03</span>
+            <h2>两套 KV 缓存，谁写谁读</h2>
+            <p class="section-note">这是移植时最容易搞错的一块。</p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>缓存</th><th>谁生成</th><th>谁读取</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>target KVCache</b></td>
+                    <td>target 在 prefill / verify 时生成</td>
+                    <td>后续 target verify 读取有效历史</td>
+                  </tr>
+                  <tr>
+                    <td><b>draft KVCache</b></td>
+                    <td>target 在 prefill / verify 时产生的<strong>有效上下文 hidden</strong>，经 draft 权重转换后写入</td>
+                    <td>下一轮 draft forward 读取</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <ol class="steps">
+              <li>
+                <h4>prefill：用 target hidden 初始化 draft KV</h4>
+                <p>
+                  target prefill 的指定层 hidden → <code>main_proj</code> / <code>main_norm</code> →
+                  各 draft 层自己的 KV 投影 / norm / RoPE → 各 draft 层自己的 KVCache。
+                  <strong>不拿 target 的 prefill KV，而是拿 target 的 hidden_states 来构造 draft KV。</strong>
+                  target 的 KV 仍然保留，供后续 verify 使用。
+                </p>
+              </li>
+              <li>
+                <h4>verify：用有效前缀的 target hidden 更新 draft KV</h4>
+                <p>
+                  「有效 token 的 hidden」指 verify <strong>输入端</strong>有效前缀的 hidden，与本轮输出错开一位。例如：
+                  verify 输入 <code>[anchor, d0, d1, d2, …]</code>，本轮输出 <code>[d0, d1, correction]</code>，
+                  则用来更新 draft KV 的是 <code>[anchor, d0, d1]</code> 的 target hidden。
+                </p>
+              </li>
+              <li>
+                <h4>下一轮 draft：读已更新的 draft 历史 KV</h4>
+                <p>完成注意力计算，往复循环。</p>
+              </li>
+            </ol>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">抽 hidden 的层号口径</span>
+              V4.1 里 <code>dspark_target_layer_ids</code> 指的是层的<strong>输入</strong>（官方 reference 与 vllm-ascend 一致）。
+              如果照搬 V4 的写法去取层的<strong>输出</strong>，就会错位一层，表现为接受率明显偏低而单步成本不变。
+            </div>
+          </section>
+
+          <section class="section wide" id="numbers">
+            <span class="section-number">04</span>
+            <h2>收益与验证强度</h2>
+
+            <div class="callout callout-info">
+              <span class="callout-label">测试条件</span>
+              Atlas A3 单机 16 卡 · DP=4 · DeepSeek-V4-Flash-0731 W8A8 · 输入约 8192 token / 输出约 1024 token · 并发 32。
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>模式</th><th class="num">平均 TPOT</th><th class="num">输出吞吐</th></tr></thead>
+                <tbody>
+                  <tr><td>Baseline（无投机）</td><td class="num">70.1 ms</td><td class="num">422.95 tok/s</td></tr>
+                  <tr><td>MTP, γ = 1</td><td class="num">45.1 ms</td><td class="num">613.76 tok/s</td></tr>
+                  <tr><td><b>DSpark, γ = 5</b></td><td class="num"><b>28.0 ms</b></td><td class="num"><b>845.74 tok/s</b></td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="facts">
+              <div><b>−60.1%</b><span>TPOT 相对 baseline</span></div>
+              <div><b>−37.9%</b><span>TPOT 相对 MTP γ=1</span></div>
+              <div><b>2.00×</b><span>输出吞吐相对 baseline</span></div>
+            </div>
+
+            <h3>逐位置接受率</h3>
+            <p>
+              数据来自 4 个请求，各约 30K 输入 / 1K 输出，γ=5 下共 951 次提案。
+              「前缀存活」是 xLLM 的逐位置计数器直接报的口径；「条件接受」是再除以到达该位置的前缀数。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>块内位置</th><th class="num">到达该位置</th><th class="num">前缀存活率</th><th class="num">条件接受率</th></tr></thead>
+                <tbody>
+                  <tr><td>0</td><td class="num">798 / 951</td><td class="num">83.9%</td><td class="num">83.9%</td></tr>
+                  <tr><td>1</td><td class="num">708 / 951</td><td class="num">74.4%</td><td class="num">88.7%</td></tr>
+                  <tr><td>2</td><td class="num">625 / 951</td><td class="num">65.7%</td><td class="num">88.3%</td></tr>
+                  <tr><td>3</td><td class="num">569 / 951</td><td class="num">59.8%</td><td class="num">91.0%</td></tr>
+                  <tr><td>4</td><td class="num">520 / 951</td><td class="num">54.7%</td><td class="num">91.4%</td></tr>
+                </tbody>
+              </table>
+            </div>
+
             <ul>
-              <li>代码、数学、格式化生成等可预测内容</li>
-              <li>需要压低 TPOT、提升单用户生成速度</li>
-              <li>草稿接受长度稳定，输出足够长可摊薄固定成本</li>
+              <li>草稿 token 总接受率：<code>3220 / 4755 = 67.7%</code></li>
+              <li>平均接受草稿长度：<code>3220 / 951 = 3.39</code></li>
+              <li>整块 5 个全中：<code>520 / 951 = 54.7%</code></li>
+              <li>含 bonus / correction 的每步平均提交长度：约 <code>4.39</code> token</li>
             </ul>
-          </article>
-          <article class="fit-card caution-fit">
-            <span>需要先测</span>
-            <h3>短输出与高熵对话</h3>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">接受率口径必须对齐后才能比</span>
+              不同测试工具统计接受率的方式不同，数值可以差出十几个百分点。跨工具、跨框架比接受率之前，
+              必须先确认分子分母的定义一致，否则结论不成立。比性能时更稳的口径是<strong>单步成本</strong>
+              （<code>TPOT × (1 + γ × 接受率)</code>），而不是直接比 TPOT。
+            </div>
+
+            <h3>验证强度</h3>
             <ul>
-              <li>TTFT 会增加，短输出可能来不及回本</li>
-              <li>开放式内容接受率低时，draft 计算可能变成纯开销</li>
-              <li>固定长度验证在高并发下可能占用过多 target batch</li>
+              <li><strong>已实测</strong>：上述 A3 单机 DP4 W8A8 条件下的 TPOT / 吞吐，以及 951 次提案的逐位置接受率。</li>
+              <li><strong>已知代价</strong>：同一组测试里 DSpark 抬高了 TTFT。</li>
+              <li><strong>未验证</strong>：多机部署、其他并发与长度组合、短输出的盈亏平衡点。</li>
             </ul>
-          </article>
+          </section>
+
+          <section class="section wide" id="limits">
+            <span class="section-number">05</span>
+            <h2>当前实现的边界</h2>
+            <ul>
+              <li>验证长度固定 5，<strong>没有置信度调度器</strong>。</li>
+              <li>不支持 <code>cp_size &gt; 1</code>。</li>
+              <li>端到端验证目前集中在 Atlas A3 单机 DP4 W8A8。</li>
+              <li>原生 DSpark 稀疏注意力模式需要显式的算子支持，默认走兼容模式。</li>
+              <li>额外的草稿权重、KV cache、图状态和 workspace 都会增加显存占用。</li>
+              <li>不支持缩减词表的 DSpark checkpoint。</li>
+            </ul>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">图模式下的一个坑</span>
+              稀疏注意力的 metadata 必须在每次图回放前刷新。移植时如果漏掉这一步，图里会一直用 warmup 时的 dummy 值，
+              表现为<strong>只在图模式下输出乱码</strong>，同时接受率掉到个位数 —— 两个症状同源。
+            </div>
+          </section>
+
+          <section class="section" id="refs">
+            <span class="section-number">06</span>
+            <h2>参考资料</h2>
+            <ul>
+              <li>DSpark 论文：<a href="https://arxiv.org/abs/2607.05147" target="_blank" rel="noreferrer">arxiv.org/abs/2607.05147</a></li>
+              <li>DFlash 论文：<a href="https://arxiv.org/abs/2602.06036" target="_blank" rel="noreferrer">arxiv.org/abs/2602.06036</a></li>
+              <li>DeepSpec 训练仓：<a href="https://github.com/deepseek-ai/DeepSpec" target="_blank" rel="noreferrer">deepseek-ai/DeepSpec</a></li>
+              <li>xLLM 适配 PR：<a href="https://github.com/xLLM-AI/xllm/pull/2172" target="_blank" rel="noreferrer">xLLM-AI/xllm#2172</a></li>
+            </ul>
+          </section>
+
+          <nav class="pager" aria-label="相邻页面">
+            <a href="../flashcomm/"><span>上一页</span><b>← FlashComm</b></a>
+            <a href="../dsa-cp/"><span>下一页</span><b>DSA CP · 注意力并行 →</b></a>
+          </nav>
         </div>
 
-        <div class="limits-grid">
-          <article><span>当前调度</span><b>固定 5-token 验证</b><p>confidence head 与硬件感知前缀调度尚未接入 xLLM。</p></article>
-          <article><span>并行边界</span><b>暂不支持 CP &gt; 1</b><p>当前实测覆盖单机 16 卡、DP4；多机和更多并行组合仍需回归。</p></article>
-          <article><span>注意力算子</span><b>默认走兼容模式</b><p>完整 DSpark SWA 语义需算子支持显式稀疏索引，并手动开启 native 模式。</p></article>
-          <article><span>显存</span><b>比 target-only 更高</b><p>增加 drafter 权重、KV cache、图与 workspace；xLLM 已合并估算 target/draft KV，仍应保留运行期余量。</p></article>
-          <article><span>权重格式</span><b>W8A8 已完成实机验证</b><p>支持共享或独立词表权重；reduced-vocabulary DSpark 暂不支持。</p></article>
-          <article><span>正确性边界</span><b>验证保持 target 分布</b><p>真正收益必须同时看输出一致性、接受长度、TPOT、吞吐与峰值显存。</p></article>
-        </div>
-      </section>
-
-      <section class="section start-section" id="start">
-        <div class="section-heading">
-          <p class="kicker">07 / START</p>
-          <h2>xLLM 中，四个参数即可开启</h2>
-          <p>DeepSeek-V4-Flash-0731 的 DSpark 权重已经包含三层 drafter、Markov head 和所需词表权重，不需要额外执行 MTP 权重导出。</p>
-        </div>
-
-        <div class="start-layout">
-          <div class="start-command">
-            <div><span>RECOMMENDED · γ=5</span><a href="https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8" target="_blank" rel="noreferrer">W8A8 权重 ↗</a></div>
-            <pre><code>--speculative_algorithm=DSpark \
---model=/path/to/DeepSeek-V4-Flash-0731-w8a8 \
---draft_model=/path/to/DeepSeek-V4-Flash-0731-w8a8 \
---num_speculative_tokens=5</code><button class="copy-button" type="button" data-copy="--speculative_algorithm=DSpark --model=/path/to/DeepSeek-V4-Flash-0731-w8a8 --draft_model=/path/to/DeepSeek-V4-Flash-0731-w8a8 --num_speculative_tokens=5">复制</button></pre>
-          </div>
-          <div class="start-rules">
-            <article><span>01</span><div><b>算法需显式指定</b><p>当前不会仅凭 checkpoint 自动判断用户要启用 DSpark。</p></div></article>
-            <article><span>02</span><div><b>model 与 draft_model 保持一致</b><p>不要对这组 DSpark 权重运行 <code>tools/export_mtp.py</code>。</p></div></article>
-            <article><span>03</span><div><b>预测数推荐 5</b><p>0731 checkpoint 按 <code>dspark_block_size=5</code> 训练，其他宽度需重新验证。</p></div></article>
-          </div>
-        </div>
-
-        <div class="takeaway-strip">
-          <span>一句话带走</span>
-          <p><strong>DSpark = 并行块草稿的速度 + 一点轻量自回归的连贯性。</strong>长输出、接受率高时，它能用一次 target 校验换回多个 token；短输出和低接受率场景先做实测。</p>
-        </div>
-      </section>
+        <aside class="toc" aria-label="本页目录">
+          <p>本页目录</p>
+          <ol>
+            <li><a href="#tldr">结论与适用条件</a></li>
+            <li><a href="#step">一次 decode step</a></li>
+            <li><a href="#kv">两套 KV 缓存</a></li>
+            <li><a href="#numbers">收益与验证强度</a></li>
+            <li><a href="#limits">实现边界</a></li>
+            <li><a href="#refs">参考资料</a></li>
+          </ol>
+        </aside>
+      </div>
     </main>
 
-    <footer>
-      <div><span class="brand-mark small-mark" aria-hidden="true">x</span><b>xLLM DSpark</b></div>
-      <p>基于 DSpark 论文、xLLM PR #2172 与 Atlas A3 实测整理 · 页面更新时间 2026-08</p>
-      <div class="footer-links">
-        <a href="https://arxiv.org/abs/2607.05147" target="_blank" rel="noreferrer">DSpark Paper ↗</a>
-        <a href="https://github.com/xLLM-AI/xllm/pull/2172" target="_blank" rel="noreferrer">xLLM PR ↗</a>
-        <a href="https://github.com/deepseek-ai/DeepSpec" target="_blank" rel="noreferrer">Training Code ↗</a>
-        <a href="../flashcomm/">FlashComm ↗</a>
+    <footer class="site-footer">
+      <div class="shell">
+        <p><a href="../">← 回到特性列表</a></p>
+        <p>性能与接受率数字只在本页标注的测试条件与统计口径下成立。</p>
       </div>
     </footer>
   </body>
