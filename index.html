@@ -54,7 +54,7 @@
       <div class="shell">
         <section class="cards" aria-label="特性列表">
           <a class="card card-wide" href="./arch/">
-            <div class="card-top"><span>00 / 模型架构</span><em>基础读物</em></div>
+            <div class="card-top"><span>01 / 模型架构</span><em>基础读物</em></div>
             <h2>DeepSeek-V4.1-Flash 模型结构</h2>
             <p>
               40 层主干为什么被叫作 Causal Encoder-Decoder；CSA2 怎么做到「每层自算 128 位滑窗、全局 KV 只有 4 层生成」；
@@ -64,37 +64,38 @@
           </a>
 
           <a class="card" href="./flashcomm/">
-            <div class="card-top"><span>01 / Prefill 通信</span><em>已实现</em></div>
-            <h2>FlashComm</h2>
+            <div class="card-top"><span>02 / Prefill 序列并行</span><em>已实现</em></div>
+            <h2>FlashComm1</h2>
             <p>
               长 prompt 的 prefill 里，把 row-parallel 线性层后的 <code>AllReduce</code> 换成 <code>ReduceScatter</code>：
               通信完成的同时序列也切好了，每个 TP rank 只处理约 <code>S/TP</code> 行 token。
+              仓里有两条独立实现线，门禁条件和收益口径都不一样。
             </p>
-            <div class="card-foot"><span>TTFT −13.4%（V4-Flash 参考值）</span><b>阅读 →</b></div>
+            <div class="card-foot"><span>TTFT −13.4%（V4 C++ 线实测）· V4.1 线未验证</span><b>阅读 →</b></div>
           </a>
 
           <a class="card" href="./dspark/">
-            <div class="card-top"><span>02 / 投机解码</span><em>已实现</em></div>
+            <div class="card-top"><span>03 / 投机解码</span><em>已实现</em></div>
             <h2>DSpark</h2>
             <p>
-              一次前向起草一整块 5 个 token，再交目标模型一次校验。讲清块并行草稿、Markov 条件头、
-              逐位置接受率，以及它为什么是 decode / 长输出优化而不是端到端优化。
+              一次前向起草一整块 5 个 token，再交目标模型一次校验。讲清块并行草稿、Markov 条件头、置信度头，
+              V4 到 V4.1 的差异，以及我们在昇腾 A3 上按时间顺序做的三项优化和下一步的 prelaunch。
             </p>
-            <div class="card-foot"><span>TPOT −60.1%（A3 单机参考值）</span><b>阅读 →</b></div>
+            <div class="card-foot"><span>单并发 TPOT 20.91 → 15.3 ms（draft 入图）</span><b>阅读 →</b></div>
           </a>
 
           <a class="card" href="./dsa-cp/">
-            <div class="card-top"><span>03 / 注意力并行</span><em>默认关闭</em></div>
+            <div class="card-top"><span>04 / 注意力并行</span><em>默认关闭</em></div>
             <h2>DSA CP</h2>
             <p>
               V4.1 的稀疏注意力在 TP 组内按 query token 行切分：KV 整份复制，每个 rank 算全部 64 个头但只算 1/TP 行 token，
               算完用一次 all-to-all 换回「全部 token × 本地头」。
             </p>
-            <div class="card-foot"><span><code>--enable_dsa_cp</code> · 要求 cp_size=1</span><b>阅读 →</b></div>
+            <div class="card-foot"><span><code>--enable_dsa_cp</code> · 与 FlashComm1 互斥</span><b>阅读 →</b></div>
           </a>
 
           <a class="card" href="./swa-replay/">
-            <div class="card-top"><span>04 / Prefill 省算</span><em>实验 · 精度有损</em></div>
+            <div class="card-top"><span>05 / Prefill 省算</span><em>实验 · 精度有损</em></div>
             <h2>SWA Bounded Replay</h2>
             <p>
               CED 架构里 decoder 层的全局 KV 全部借自第 20 层，自己只需要最近若干 token 的滑窗。
@@ -104,7 +105,7 @@
           </a>
 
           <a class="card" href="./engram-offload/">
-            <div class="card-top"><span>05 / 显存换带宽</span><em>默认关闭</em></div>
+            <div class="card-top"><span>06 / 显存换带宽</span><em>默认关闭</em></div>
             <h2>Engram 主机侧卸载</h2>
             <p>
               V4.1 的 196B n-gram 查表参数在 W8A8 下每卡约 27.7 GiB 常驻显存。把表搬到 host 内存，

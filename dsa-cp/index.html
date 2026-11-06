@@ -37,7 +37,7 @@
     <main id="main">
       <section class="hero">
         <div class="shell">
-          <p class="eyebrow">03 / 注意力并行 · DeepSeek-V4.1</p>
+          <p class="eyebrow">04 / 注意力并行 · DeepSeek-V4.1</p>
           <h1>DSA CP：KV 整份复制，只切 query 的 token 行</h1>
           <p class="hero-lede">
             常规 TP 把注意力按<strong>头</strong>切：每个 rank 拿 <code>n_heads / TP</code> 个头，但要处理<strong>全部</strong> token 行。
@@ -223,6 +223,20 @@ return received[: num_tokens]</code></pre>
               <strong>decode keeps the original TP path</strong>」。但 <code>dsa_cp.py</code> 里有专门处理 decode ACL 图的分支
               （<code>is_acl_graph</code> 时取 <code>[1] * rows</code>），attention forward 里的启用判断也没有区分 prefill / decode。
               <strong>以代码为准：decode 同样会走 CP 路径。</strong>这段帮助文本看起来是旧的，尚未在仓里修正。
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">与 FlashComm1 互斥</span>
+              <p>
+                V4.1 的 <code>_validate_flashcomm1</code> 把 <code>enable_dsa_cp</code> 列为否决条件之一。
+                <strong>两个开关都传 true 时，FlashComm1 被静默关掉（只留一条 warning），DSA CP 照常生效。</strong>
+              </p>
+              <p>
+                原因是两者都在切同一个 token 轴：DSA CP 切 attention 的 query 行，
+                FlashComm1 切 row-parallel 之后的激活行。叠加会把序列切两次。
+                所以它们的收益<strong>不能相加估算</strong>，要在目标配置上各自实测再取其一。
+                见 <a href="../flashcomm/#gate">FlashComm1 的准入门禁</a>。
+              </p>
             </div>
           </section>
 

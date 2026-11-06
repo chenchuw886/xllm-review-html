@@ -657,3 +657,29 @@ figcaption {
   color: var(--muted);
 }
 .site-footer p { margin: 0 0 6px; }
+
+/* ---------- collapsible aside ---------- */
+
+details {
+  margin: 20px 0;
+  padding: 0 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  max-width: min(920px, 100%);
+}
+details > summary {
+  margin: 0 -18px;
+  padding: 14px 18px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--accent);
+  list-style: none;
+}
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: "▸ "; color: var(--faint); }
+details[open] > summary::before { content: "▾ "; }
+details[open] > summary { border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+details > summary:hover { color: var(--ink); }
+details > :last-child { margin-bottom: 16px; }

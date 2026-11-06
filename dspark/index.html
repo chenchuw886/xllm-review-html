@@ -6,7 +6,7 @@
     <title>DSpark｜xLLM 特性解读</title>
     <meta
       name="description"
-      content="xLLM DSpark 投机解码：块并行草稿 + Markov 条件头 + 置信度头。讲清一次 decode step 的时序、逐位置接受率、两套 KV 缓存，以及当前实现的边界。"
+      content="DeepSeek-V4.1-Flash 的 DSpark 投机解码：块并行草稿 + Markov 条件头 + 置信度头的原理，一次 decode step 的完整链路，V4 到 V4.1 的差异，以及我们在昇腾 A3 上按时间顺序做的三项优化与下一步的 prelaunch。"
     />
     <meta name="color-scheme" content="light dark" />
     <link rel="stylesheet" href="../assets/site.css" />
@@ -21,7 +21,7 @@
         <nav class="topnav" aria-label="特性导航">
           <a href="../">首页</a>
           <a href="../arch/">V4.1 架构</a>
-          <a href="../flashcomm/">FlashComm</a>
+          <a href="../flashcomm/">FlashComm1</a>
           <a href="../dspark/" aria-current="page">DSpark</a>
           <a href="../dsa-cp/">DSA CP</a>
           <a href="../swa-replay/">SWA 回放</a>
@@ -37,17 +37,19 @@
     <main id="main">
       <section class="hero">
         <div class="shell">
-          <p class="eyebrow">02 / Decode · 投机解码</p>
-          <h1>DSpark：一次起草一整块，一把交给大模型校验</h1>
+          <p class="eyebrow">03 / 投机解码</p>
+          <h1>DSpark：块并行草稿 + Markov 条件 + 主模型验证</h1>
           <p class="hero-lede">
-            普通投机解码的草稿模型要串行跑 γ 次才能起草 γ 个 token。DSpark 用一个并行 backbone
-            <strong>一次前向就算出块内全部位置</strong>，再用两个极轻的头把「后一个词依赖前一个词」这件事补回来。
-            目标模型随后只做一次校验。
+            DSpark 是 DeepSeek-V4.1-Flash 的投机解码方案。一个独立的小草稿模型一次猜 5 个 token，
+            主模型一次最多验 6 个位置，从第一个开始连续对上的全部接受。
+            这一页讲清三件事：它<strong>怎么工作</strong>、V4 到 V4.1 <strong>改了什么</strong>、
+            我们在昇腾 A3 上<strong>按时间顺序做了哪三项优化</strong>以及下一步的 prelaunch。
           </p>
           <ul class="chips">
             <li class="chip chip-good">已实现</li>
-            <li class="chip chip-good">A3 单机已实测</li>
-            <li class="chip chip-info">Decode / 长输出优化</li>
+            <li class="chip chip-good">已实测（A3）</li>
+            <li class="chip chip-info">γ = 5 · greedy 无损</li>
+            <li class="chip chip-warn">三项优化测试条件不同</li>
           </ul>
         </div>
       </section>
@@ -56,263 +58,823 @@
         <div class="doc-main">
           <section class="section" id="tldr">
             <span class="section-number">01</span>
-            <h2>一句话结论与适用条件</h2>
+            <h2>一页读懂</h2>
+
+            <div class="callout callout-info">
+              <span class="callout-label">先对齐四个词，后面全文复用</span>
+              <p><b>单步耗时</b> = 一次 draft + 一次 verify 的总耗时。</p>
+              <p><b>接受长度 τ</b> = 一轮实际产出的 token 数，<strong>含 target 自己产出的那 1 个</strong>，范围 1–6。</p>
+              <p><b>接受率</b> = 5 个草稿提案里被接受的比例（不含 target 产出的那个）。</p>
+              <p><b>TPOT</b> = 平均每个输出 token 的耗时，约等于 单步耗时 ÷ τ。越低越好。</p>
+            </div>
 
             <div class="summary">
               <div>
-                <dt>解决什么问题</dt>
-                <dd>decode 阶段每步只产出 1 个 token，但每步都要把整个 MoE 大模型跑一遍。算力利用率低，TPOT 被访存和下发开销主导。</dd>
+                <dt>是什么</dt>
+                <dd>
+                  <strong>独立的</strong>草稿模型：3 层、纯 SWA 滑窗 128、MoE 为 1 个 shared + 128 个 routed experts（每 token 选 3 个）。
+                  权重在 checkpoint 的 <code>mtp.0/1/2</code>。embedding 和 LM head 与 target 共享且冻结。
+                  <strong>它不是主模型内部的 MTP 层。</strong>
+                </dd>
               </div>
               <div>
-                <dt>做了什么</dt>
-                <dd>用一个 3 层的轻量草稿模型一次起草 5 个 token，目标模型一次校验这一整块，接受最长的合法前缀，并顺带拿到一个 bonus token。</dd>
+                <dt>怎么猜</dt>
+                <dd>
+                  一次 draft 前向算出 5 个位置的 base logits；再用低秩 Markov 头做 5 步顺序修正（每步看前一个 token 的偏置），得到 5 个提案。
+                </dd>
               </div>
               <div>
-                <dt>什么时候开</dt>
-                <dd>decode 占端到端时延比例高的场景：长输出、中低并发。接受率越高，收益越大。</dd>
+                <dt>怎么验</dt>
+                <dd>
+                  主模型一次验 <code>[anchor, d0…d4]</code> 共 6 个位置。greedy 下从第一个开始连续对上的全部接受；
+                  之后 target 总会再产出 1 个 token —— 有拒绝时是纠正 token，全中时是第 6 位的预测（bonus）。
+                  这个 token 就是下一轮的 anchor。
+                </dd>
               </div>
               <div>
-                <dt>什么时候别开</dt>
-                <dd>短输出（起草开销摊不回来）、prefill 主导的场景。在我们的实测里 <strong>DSpark 会抬高 TTFT</strong>，它不是端到端无条件的赢。</dd>
+                <dt>为什么快</dt>
+                <dd>
+                  论文公式 <code>L = (T_draft + T_verify) / τ</code>：每 token 耗时 = 单步耗时 ÷ 接受长度。
+                  三条杠杆 —— draft 更快、τ 更大、verify 更省。我们这三项优化动的是第一条和第三条。
+                </dd>
               </div>
             </div>
 
-            <div class="callout callout-info">
-              <span class="callout-label">三个层次不要混</span>
-              <p><strong>① 投机解码</strong>：一个无损的 draft-and-verify 算法，接受与目标分布一致的最长草稿前缀。</p>
-              <p><strong>② DSpark 论文的完整设计</strong>：半自回归块草稿 + 置信度调度的验证长度。</p>
-              <p><strong>③ xLLM 当前实现</strong>：固定 5 token 的块草稿（并行 backbone + 低秩 Markov 头）+ 目标模型校验。<strong>尚未加载 checkpoint 的置信度头，也没有实现论文的硬件感知前缀调度器。</strong>所以本页不把论文里在线调度带来的收益算到当前实测上。</p>
+            <h3>我们做了什么</h3>
+            <div class="facts">
+              <div>
+                <span>单并发 TPOT</span>
+                <b>15.3 ms</b>
+                <span>draft 入图后。入图前（成块 + MC2）为 20.91 ms；c=1、greedy、γ=5</span>
+              </div>
+              <div>
+                <span>draft 设备时间</span>
+                <b>5.3 ms / 步</b>
+                <span>图内 body + LM head + Markov。来自另一次 profile，与上面的 15.3 ms 不是同一次测量</span>
+              </div>
+              <div>
+                <span>整步大头仍是 verify</span>
+                <b>55.3 ms</b>
+                <span>profile 单步拆解 79.7 ms 中的 verify 部分，是主模型工作量，与 draft 优化无关</span>
+              </div>
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">引用这些数字前必读</span>
+              <p>
+                三项优化的测试条件<strong>不同</strong>：成块是并发 4，MC2 和入图是并发 1。
+                <strong>百分比不能相加也不能相乘。</strong>
+              </p>
+              <p>
+                <code>15.3 ms</code>（压测得到）与 <code>79.7 / 55.3 / 5.3 ms</code>（profile 单分片得到）
+                <strong>不是同一次测量</strong>，不能用 79.7 ÷ 15.3 去反推接受长度。
+              </p>
+            </div>
+          </section>
+
+          <section class="section wide" id="principle">
+            <span class="section-number">02</span>
+            <h2>原理：三个部件，各管一件事</h2>
+            <p class="section-note">
+              传统 MTP 是串行的：第 k 个草稿 token 依赖第 k−1 个，只能一步一步来。
+              DSpark 先把 5 个位置一次并行算出来，再把丢掉的块内依赖补回去。
+            </p>
+
+            <ul class="steps">
+              <li>
+                <h4>① 块并行草稿 —— 一次前向出 γ 个位置</h4>
+                <p>
+                  输入是 <code>[anchor, mask×(γ−1)]</code>，位置 <code>p…p+γ−1</code>。
+                  <code>mask</code> 是训练好的占位 token（论文叫 mask token，代码里叫 noise token，同一个东西）。
+                  块内 5 个位置<strong>互相可见（双向、非因果）</strong>并共享同一段尾窗上下文，所以可以一次算完。
+                  块宽 <code>γ = num_speculative_tokens = dspark_block_size = 5</code>。
+                </p>
+              </li>
+              <li>
+                <h4>② Markov 条件头 —— 把块内依赖补回来</h4>
+                <p>
+                  并行算的时候每个位置看不到"前一个草稿 token 是什么"，依赖丢了。
+                  Markov 头是个很小的修正项：<code>markov_w1</code> 把前一个 token 压成 256 维，
+                  <code>markov_w2</code> 投回词表得到一个 bias，当前位的 <code>logits = base + bias</code>。
+                  第 0 位看 anchor，之后每一位看前一位选出的 token。
+                  γ 步串行，每步只做一次 embedding + 一次线性 + argmax。
+                </p>
+              </li>
+              <li>
+                <h4>③ 置信度头 —— 给每个位置一个存活概率</h4>
+                <p>
+                  把当前位的 hidden 和前一个 token 的 Markov 嵌入拼起来，过一层线性 + sigmoid，
+                  得到 0–1 的<strong>条件</strong>接受概率；前缀各位相乘就是前缀存活概率。
+                  它<strong>不参与提案生成</strong>，只给调度器提供"这一位值不值得验"的分数。
+                  V4.1 默认构建，但<strong>本部署不开 adaptive</strong>，所以它不影响已生成的提案。
+                </p>
+              </li>
+            </ul>
+
+            <p><strong>三句话分工：Markov 补依赖、target 保正确、confidence 供调度。</strong></p>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">一个最常见的误解</span>
+              draft 模型<strong>不是</strong>主模型内部的 MTP 层。它是独立加载的模型，有自己的 3 层权重和自己的 SWA KV 缓存。
+              它的上下文由 target 喂：主干 40 层里取第 37/38/39 层（<code>dspark_target_layer_ids</code>）的残差流，
+              经 <code>main_proj</code> 投影后作为 draft 每层注意力的 KV。
+              所以"改 draft"和"改主模型"是两条可以<strong>分别评估</strong>的线。
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">V4.1 的取点位置与 V4 相差一层</span>
+              <p>
+                <code>dspark_target_layer_ids</code> 在 V4.1 指这几层的<strong>输入</strong>残差流
+                （即进入第 37/38/39 层注意力之前的残差流，等于第 36/37/38 层的输出；4 条 mHC 流取平均）。
+                官方 reference 的注释原文：<em>reads the attention input of its target layers, not their output</em>。
+              </p>
+              <p>
+                <strong>V4 的同名字段指层输出。</strong>照搬 V4 实现会整体错位一层。
+                这是一个实测过代价的坑：同树同二进制、只差取点位置，接受率差 18 个百分点量级。
+              </p>
             </div>
           </section>
 
           <section class="section wide" id="step">
-            <span class="section-number">02</span>
+            <span class="section-number">03</span>
             <h2>一次 decode step：从 anchor 到下一个 anchor</h2>
+            <p class="section-note">
+              这条链路就是 DSpark 的全部内容，也是后面所有优化的作用对象。
+              先记住它，第 8 节再回来看哪几段被搬进了图。
+            </p>
+
+            <ul class="steps">
+              <li>
+                <h4>① 取 anchor</h4>
+                <p>取上一轮 target 产出的那个 token 和它的位置 <code>p</code>。它还没被 target 前向过，所以 draft 的上下文只到 <code>p−1</code>。</p>
+              </li>
+              <li>
+                <h4>② context KV 注入</h4>
+                <p>把 target 第 37/38/39 层的残差流经 <code>main_proj</code> 投影，生成 draft 每层要用的 KV，写进 draft 自己的 SWA 缓存。</p>
+              </li>
+              <li>
+                <h4>③ draft 块前向</h4>
+                <p>输入 <code>[anchor, mask×4]</code>，位置 <code>p…p+4</code>；5 个位置互相可见，共享同一段尾窗上下文。</p>
+              </li>
+              <li>
+                <h4>④ Markov × γ</h4>
+                <p>串行 5 步。本部署 greedy，每步 <code>argmax(base_k + 低秩偏置(prev))</code>；<code>prev</code> 是 anchor 或上一位选出的 token。</p>
+              </li>
+              <li>
+                <h4>⑤ target verify</h4>
+                <p>主模型一次验 <code>[anchor, d0…d4]</code> 共 6 个位置（本部署固定 6 位），每个位置都出 logits。</p>
+              </li>
+              <li>
+                <h4>⑥ 接受判定</h4>
+                <p>从第一个开始连续对上的全部接受；再加 target 产出的 1 个 token —— 有拒绝时是纠正 token，全中时是 bonus。</p>
+              </li>
+              <li>
+                <h4>⑦ 缓存与下一步</h4>
+                <p>用 verify 输入端有效前缀的 target 残差流更新 draft KV；target 产出的那个 token 成为下一轮 anchor。</p>
+              </li>
+            </ul>
+
+            <h3>位置与可见性：这张图解释了"块"到底长什么样</h3>
 
             <figure>
-              <svg viewBox="0 0 860 300" role="img" aria-label="DSpark 一次 decode step：anchor hidden 投影进草稿模型，并行 backbone 出 5 个位置的 base logits，Markov 头串行修正出草稿链，目标模型一次校验" class="dg">
-                <rect class="dg-box" x="16" y="44" width="116" height="62" rx="6" />
-                <text class="dg-t" x="74" y="68" text-anchor="middle">anchor</text>
-                <text class="dg-t-sm" x="74" y="86" text-anchor="middle">目标模型抽出的 hidden</text>
+              <svg viewBox="0 0 860 332" role="img" aria-label="draft 的 6 个输入位与 5 个提案，以及 verify 的 6 个输入位与 6 个预测的对应关系" class="dg">
+                <text class="dg-t-sm" x="18" y="34">draft 输入</text>
+                <rect class="dg-box" x="88" y="22" width="140" height="34" rx="4" />
+                <text class="dg-t-sm" x="98" y="36">p−128 … p−1</text>
+                <text class="dg-t-sm" x="98" y="50">SWA 尾窗（共享）</text>
 
-                <path class="dg-line-accent" d="M132 75 h38" /><path class="dg-fill-accent" d="M172 75 l-9 -5 v10 z" />
+                <rect class="dg-box-good" x="236" y="22" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="246" y="36">p</text>
+                <text class="dg-t-sm" x="246" y="50">anchor</text>
 
-                <rect class="dg-box-accent" x="176" y="30" width="230" height="92" rx="6" />
-                <text class="dg-t" x="190" y="52">阶段 1 · 并行 Backbone（跑 1 次）</text>
-                <text class="dg-t-sm" x="190" y="72">3 层 SWA-MLA + MoE，window = 128</text>
-                <text class="dg-t-sm" x="190" y="88">块内 5 个位置互不 attend</text>
-                <text class="dg-t-key" x="190" y="110">→ h₁..h₅ 与 base logits L₁..L₅</text>
+                <rect class="dg-box-amber" x="320" y="22" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="330" y="36">p+1</text><text class="dg-t-sm" x="330" y="50">mask</text>
+                <rect class="dg-box-amber" x="404" y="22" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="414" y="36">p+2</text><text class="dg-t-sm" x="414" y="50">mask</text>
+                <rect class="dg-box-amber" x="488" y="22" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="498" y="36">p+3</text><text class="dg-t-sm" x="498" y="50">mask</text>
+                <rect class="dg-box-amber" x="572" y="22" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="582" y="36">p+4</text><text class="dg-t-sm" x="582" y="50">mask</text>
 
-                <path class="dg-line-accent" d="M406 75 h38" /><path class="dg-fill-accent" d="M446 75 l-9 -5 v10 z" />
+                <text class="dg-t-sm" x="18" y="92">draft 预测</text>
+                <rect class="dg-box-dim" x="236" y="78" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="246" y="97">d0 → p+1</text>
+                <rect class="dg-box-dim" x="320" y="78" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="330" y="97">d1 → p+2</text>
+                <rect class="dg-box-dim" x="404" y="78" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="414" y="97">d2 → p+3</text>
+                <rect class="dg-box-dim" x="488" y="78" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="498" y="97">d3 → p+4</text>
+                <rect class="dg-box-dim" x="572" y="78" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="582" y="97">d4 → p+5</text>
 
-                <rect class="dg-box-good" x="450" y="30" width="236" height="92" rx="6" />
-                <text class="dg-t" x="464" y="52">阶段 2 · 串行轻量头</text>
-                <text class="dg-t-sm" x="464" y="72">Markov：zₖ = Lₖ + B(yₖ₋₁)，greedy</text>
-                <text class="dg-t-sm" x="464" y="88">只有查表 + gemv + add + argmax</text>
-                <text class="dg-t-key" x="464" y="110">→ 草稿链 y₁..y₅</text>
+                <path class="dg-line-accent" d="M444 112 v22" />
+                <path class="dg-fill-accent" d="M444 140 l-5 -9 h10 z" />
+                <text class="dg-t-key" x="456" y="129">γ=5 个提案交给主模型</text>
 
-                <path class="dg-line" d="M568 122 v34 h-300 v22" />
-                <path class="dg-fill-line" d="M268 182 l-5 -9 h10 z" />
+                <text class="dg-t-sm" x="18" y="166">verify 输入</text>
+                <rect class="dg-box" x="88" y="154" width="140" height="34" rx="4" />
+                <text class="dg-t-sm" x="98" y="168">target 历史 KV</text>
+                <text class="dg-t-sm" x="98" y="182">完整上下文</text>
 
-                <rect class="dg-box-amber" x="136" y="186" width="264" height="86" rx="6" />
-                <text class="dg-t" x="150" y="208">目标模型 verify（1 次前向）</text>
-                <text class="dg-t-sm" x="150" y="228">输入：anchor d₀ d₁ d₂ d₃ d₄</text>
-                <text class="dg-t-sm" x="150" y="244">预测：d₀ d₁ d₂ d₃ d₄ d₅</text>
-                <text class="dg-t-sm" x="150" y="262">每一行都预测下一个 token</text>
+                <rect class="dg-box-good" x="236" y="154" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="246" y="168">p</text><text class="dg-t-sm" x="246" y="182">anchor</text>
+                <rect class="dg-box-accent" x="320" y="154" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="330" y="168">p+1</text><text class="dg-t-sm" x="330" y="182">d0</text>
+                <rect class="dg-box-accent" x="404" y="154" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="414" y="168">p+2</text><text class="dg-t-sm" x="414" y="182">d1</text>
+                <rect class="dg-box-accent" x="488" y="154" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="498" y="168">p+3</text><text class="dg-t-sm" x="498" y="182">d2</text>
+                <rect class="dg-box-accent" x="572" y="154" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="582" y="168">p+4</text><text class="dg-t-sm" x="582" y="182">d3</text>
+                <rect class="dg-box-accent" x="656" y="154" width="80" height="34" rx="4" />
+                <text class="dg-t-mono" x="666" y="168">p+5</text><text class="dg-t-sm" x="666" y="182">d4</text>
 
-                <path class="dg-line" d="M400 228 h46" /><path class="dg-fill-line" d="M448 228 l-9 -5 v10 z" />
+                <text class="dg-t-sm" x="18" y="224">verify 预测</text>
+                <rect class="dg-box-dim" x="236" y="210" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="246" y="229">→p+1 比 d0</text>
+                <rect class="dg-box-dim" x="320" y="210" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="330" y="229">→p+2 比 d1</text>
+                <rect class="dg-box-dim" x="404" y="210" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="414" y="229">→p+3 比 d2</text>
+                <rect class="dg-box-dim" x="488" y="210" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="498" y="229">→p+4 比 d3</text>
+                <rect class="dg-box-dim" x="572" y="210" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="582" y="229">→p+5 比 d4</text>
+                <rect class="dg-box-good" x="656" y="210" width="80" height="30" rx="4" />
+                <text class="dg-t-mono" x="666" y="229">→p+6 bonus</text>
 
-                <rect class="dg-box" x="452" y="186" width="234" height="86" rx="6" />
-                <text class="dg-t" x="466" y="208">接受最长合法前缀</text>
-                <text class="dg-t-sm" x="466" y="228">全对 → 末行预测是 <tspan class="dg-t-key">bonus</tspan></text>
-                <text class="dg-t-sm" x="466" y="246">中途错 → 该行预测是 <tspan class="dg-t-key">correction</tspan></text>
-                <text class="dg-t-sm" x="466" y="264">→ 新 anchor，进入下一轮</text>
+                <rect class="dg-box-dim" x="18" y="258" width="824" height="66" rx="6" />
+                <text class="dg-t-sm" x="34" y="278">灰＝上下文（draft 侧是 SWA 尾窗 128，5 个 query 共享同一段）　绿＝anchor / bonus　橙＝draft 的 4 个 mask 输入位　蓝＝verify 的输入位</text>
+                <text class="dg-t-sm" x="34" y="296">虚线框是输出，不是输入位。target 每个输入位都预测下一个位置：第 i 个预测和 di 比对，从头连续相等的接受。</text>
+                <text class="dg-t-sm" x="34" y="314">第一个不等的位置直接用 target 的预测作纠正 token；5 个全中时，最后一位（→p+6）的预测就是 bonus。</text>
               </svg>
               <figcaption>
-                correction 和 bonus 都来自 verify 的逐行预测，不是额外一次前向。所以一步提交的长度是
-                <code>接受的草稿数 + 1</code>。
+                块内先后依赖<strong>不靠 attention mask</strong>，而由 Markov 头在采样阶段补。
+                「块内双向可见」和「块内 token 有先后依赖」是两件事，要分开理解。
               </figcaption>
             </figure>
 
-            <h3>两个轻量头</h3>
-            <p>
-              <strong>Markov 头</strong>（默认 rank 256）：用一个 token-到-token 转移矩阵的低秩分解给出偏置
-              <code>B(y) = W₁[y] @ W₂</code>。循环 k=1..5：查 <code>W₁</code> 得到 r 维向量，乘 <code>W₂</code> 得到词表长度的 bias，
-              加到 <code>Lₖ</code> 上后 greedy argmax。全程<strong>没有 attention、没有 KV 更新、没有 norm / MoE</strong>。
-            </p>
-            <p>
-              <strong>Confidence 头</strong>（论文设计）：输入当前位置 hidden 和上一个 token 的 Markov embedding，
-              concat 过线性层加 sigmoid，给出「在前面全部 accept 的前提下，第 k 个 token 能通过验证的概率」。
-              调度器据此提前截断验证长度，不去验证后面低置信的草稿。
-              <strong>xLLM 当前实现没有加载这个头，验证长度固定为 5。</strong>
-            </p>
+            <div class="callout callout-info">
+              <span class="callout-label">猜错不影响正确性，但不是零成本</span>
+              <p>
+                接受的是<strong>连续前缀</strong>；第一个错的位置用 target 的预测纠正，后面的草稿丢弃。
+                所以 greedy 下输出和只跑 target 逐 token 完全一致（<strong>无损</strong>）。最坏情况是这一轮只产出 1 个 token。
+              </p>
+              <p>
+                代价在 verify：<strong>被拒绝的位置也算了一遍</strong>。
+                低并发时几乎免费，高并发时会挤占 batch 容量 —— 这正是论文引入置信度调度的原因。
+              </p>
+            </div>
           </section>
 
-          <section class="section wide" id="kv">
-            <span class="section-number">03</span>
-            <h2>两套 KV 缓存，谁写谁读</h2>
-            <p class="section-note">这是移植时最容易搞错的一块。</p>
+          <section class="section wide" id="draft">
+            <span class="section-number">04</span>
+            <h2>draft 模型结构：3 层、3 个头、一个投影</h2>
+            <p class="section-note">
+              draft 很小：一个输入投影 + 3 个解码层 + 3 个输出头。
+              算力很小，但如果每个算子都从 host 逐个发，<strong>发射时间会比计算还长</strong> ——
+              这是理解第 8 节那项优化的前提。
+            </p>
 
             <div class="table-wrap">
               <table>
-                <thead><tr><th>缓存</th><th>谁生成</th><th>谁读取</th></tr></thead>
+                <thead><tr><th>组件</th><th>作用</th><th>关键点</th></tr></thead>
                 <tbody>
                   <tr>
-                    <td><b>target KVCache</b></td>
-                    <td>target 在 prefill / verify 时生成</td>
-                    <td>后续 target verify 读取有效历史</td>
+                    <td><code>main_proj</code> / <code>main_norm</code></td>
+                    <td>target 残差流 → draft hidden</td>
+                    <td>把 3 个捕获层的残差流拼成 <code>3H</code>（3×5120）再压回 <code>H</code>；列并行 + all-gather；官方导出 BF16，也支持 W8A8</td>
                   </tr>
                   <tr>
-                    <td><b>draft KVCache</b></td>
-                    <td>target 在 prefill / verify 时产生的<strong>有效上下文 hidden</strong>，经 draft 权重转换后写入</td>
-                    <td>下一轮 draft forward 读取</td>
+                    <td>3 个解码层</td>
+                    <td>draft 主体前向</td>
+                    <td>纯 SWA 滑窗 128；每层写自己的 KV；MoE 为 1 shared + 128 routed / top-3；残差流同为 mHC 4 路。<strong>没有 Engram、没有哈希路由</strong></td>
+                  </tr>
+                  <tr>
+                    <td>LM head</td>
+                    <td>hidden → 全词表 logits</td>
+                    <td>与 target 共享权重并冻结；但<strong>整图路径要求 draft 自己从 checkpoint 加载一份</strong>，不能运行时借用 target 的模块</td>
+                  </tr>
+                  <tr>
+                    <td>Markov 头</td>
+                    <td>γ 步条件采样</td>
+                    <td>低秩（rank 256）；<strong>每张卡放一份、不切分</strong>，每步无跨卡通信</td>
+                  </tr>
+                  <tr>
+                    <td>置信度头</td>
+                    <td>每位置存活概率</td>
+                    <td>默认构建；生产不开 adaptive，所以不影响提案</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
-            <ol class="steps">
-              <li>
-                <h4>prefill：用 target hidden 初始化 draft KV</h4>
-                <p>
-                  target prefill 的指定层 hidden → <code>main_proj</code> / <code>main_norm</code> →
-                  各 draft 层自己的 KV 投影 / norm / RoPE → 各 draft 层自己的 KVCache。
-                  <strong>不拿 target 的 prefill KV，而是拿 target 的 hidden_states 来构造 draft KV。</strong>
-                  target 的 KV 仍然保留，供后续 verify 使用。
-                </p>
-              </li>
-              <li>
-                <h4>verify：用有效前缀的 target hidden 更新 draft KV</h4>
-                <p>
-                  「有效 token 的 hidden」指 verify <strong>输入端</strong>有效前缀的 hidden，与本轮输出错开一位。例如：
-                  verify 输入 <code>[anchor, d0, d1, d2, …]</code>，本轮输出 <code>[d0, d1, correction]</code>，
-                  则用来更新 draft KV 的是 <code>[anchor, d0, d1]</code> 的 target hidden。
-                </p>
-              </li>
-              <li>
-                <h4>下一轮 draft：读已更新的 draft 历史 KV</h4>
-                <p>完成注意力计算，往复循环。</p>
-              </li>
-            </ol>
-
-            <div class="callout callout-warn">
-              <span class="callout-label">抽 hidden 的层号口径</span>
-              V4.1 里 <code>dspark_target_layer_ids</code> 指的是层的<strong>输入</strong>（官方 reference 与 vllm-ascend 一致）。
-              如果照搬 V4 的写法去取层的<strong>输出</strong>，就会错位一层，表现为接受率明显偏低而单步成本不变。
-            </div>
-          </section>
-
-          <section class="section wide" id="numbers">
-            <span class="section-number">04</span>
-            <h2>收益与验证强度</h2>
+            <p>
+              最后一层把 mHC 的 4 路残差副本折叠回 1 路，再 norm，然后过 LM head 出全词表 logits。
+            </p>
 
             <div class="callout callout-info">
-              <span class="callout-label">测试条件</span>
-              Atlas A3 单机 16 卡 · DP=4 · DeepSeek-V4-Flash-0731 W8A8 · 输入约 8192 token / 输出约 1024 token · 并发 32。
+              <span class="callout-label">两个"复制"决定</span>
+              Markov 头与置信度头在所有并行分片上都放一份，不做切分。
+              这样每步采样不需要跨卡通信 —— 这也是 Markov 链<strong>能整图捕获</strong>的直接原因。
             </div>
 
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>模式</th><th class="num">平均 TPOT</th><th class="num">输出吞吐</th></tr></thead>
-                <tbody>
-                  <tr><td>Baseline（无投机）</td><td class="num">70.1 ms</td><td class="num">422.95 tok/s</td></tr>
-                  <tr><td>MTP, γ = 1</td><td class="num">45.1 ms</td><td class="num">613.76 tok/s</td></tr>
-                  <tr><td><b>DSpark, γ = 5</b></td><td class="num"><b>28.0 ms</b></td><td class="num"><b>845.74 tok/s</b></td></tr>
-                </tbody>
-              </table>
+            <div class="callout callout-warn">
+              <span class="callout-label">一个必须说清楚的约束：全词表</span>
+              V4.1 的 draft 是全词表的（<code>draft_vocab_size == vocab_size</code>，<strong>没有 d2t 映射表</strong>）。
+              d2t 是「draft id → target id」的映射；没有它，提案 token 可以直接喂给 target 验证。
+              如果某个 checkpoint 用了热词表 + remap，整图路径会在<strong>启动阶段拒绝</strong>，不会静默降级。
             </div>
+          </section>
 
-            <div class="facts">
-              <div><b>−60.1%</b><span>TPOT 相对 baseline</span></div>
-              <div><b>−37.9%</b><span>TPOT 相对 MTP γ=1</span></div>
-              <div><b>2.00×</b><span>输出吞吐相对 baseline</span></div>
-            </div>
-
-            <h3>逐位置接受率</h3>
-            <p>
-              数据来自 4 个请求，各约 30K 输入 / 1K 输出，γ=5 下共 951 次提案。
-              「前缀存活」是 xLLM 的逐位置计数器直接报的口径；「条件接受」是再除以到达该位置的前缀数。
+          <section class="section wide" id="versions">
+            <span class="section-number">05</span>
+            <h2>V4 → V4.1：改的是训练阶段和专家几何</h2>
+            <p class="section-note">
+              先给结论：<strong>DSpark 的算法骨架没变</strong>。
+              变的是训练阶段的组织方式，和 draft 自己的 MoE 几何。
             </p>
 
             <div class="table-wrap">
               <table>
-                <thead><tr><th>块内位置</th><th class="num">到达该位置</th><th class="num">前缀存活率</th><th class="num">条件接受率</th></tr></thead>
+                <thead><tr><th>维度</th><th>V4-Flash（V4 代 DSpark）</th><th>V4.1-Flash</th></tr></thead>
                 <tbody>
-                  <tr><td>0</td><td class="num">798 / 951</td><td class="num">83.9%</td><td class="num">83.9%</td></tr>
-                  <tr><td>1</td><td class="num">708 / 951</td><td class="num">74.4%</td><td class="num">88.7%</td></tr>
-                  <tr><td>2</td><td class="num">625 / 951</td><td class="num">65.7%</td><td class="num">88.3%</td></tr>
-                  <tr><td>3</td><td class="num">569 / 951</td><td class="num">59.8%</td><td class="num">91.0%</td></tr>
-                  <tr><td>4</td><td class="num">520 / 951</td><td class="num">54.7%</td><td class="num">91.4%</td></tr>
+                  <tr>
+                    <td><b>训练阶段</b></td>
+                    <td>backbone 预训练<strong>带</strong> MTP（V4 报告：Flash 的 MTP 深度 1）；线上先用 MTP-1，V4-preview 发布两周后被 DSpark 替换</td>
+                    <td>backbone 预训练<strong>去掉</strong> MTP；DSpark 在预训练后的独立阶段训练，backbone 冻结；post-training 与 backbone 联合但 DSpark 梯度不回传</td>
+                  </tr>
+                  <tr>
+                    <td><b>训练目标</b></td>
+                    <td><code>CE 0.1 + TV 0.9 + confidence 1.0</code>；位置权重 <code>w_k = exp(−(k−1)/γ)</code>，越靠前权重越高</td>
+                    <td>同一套目标；V4.1 报告未给权重</td>
+                  </tr>
+                  <tr>
+                    <td><b>主模型 routed / top-k</b></td>
+                    <td>256 / top-6（V4-Flash config）</td>
+                    <td>384 / top-6（Tech Report §2.2）</td>
+                  </tr>
+                  <tr>
+                    <td><b>draft routed / top-k</b></td>
+                    <td>无独立字段，<em>推断</em>沿用主模型 256 / top-6</td>
+                    <td><strong>1 shared + 128 routed / top-3</strong>（官方 config）</td>
+                  </tr>
+                  <tr>
+                    <td><b>置信度头</b></td>
+                    <td>和 draft 一起端到端训练，再用 STS（逐位置温度缩放）校准</td>
+                    <td>逐位置的条件接受概率，供调度器选验证长度</td>
+                  </tr>
+                  <tr>
+                    <td><b>推理侧不变的部分</b></td>
+                    <td colspan="2">anchor-first、γ 宽非因果块、一次 draft 前向出 5 个位置、γ 步 Markov、target 一次最多验 γ+1 位</td>
+                  </tr>
                 </tbody>
               </table>
             </div>
 
-            <ul>
-              <li>草稿 token 总接受率：<code>3220 / 4755 = 67.7%</code></li>
-              <li>平均接受草稿长度：<code>3220 / 951 = 3.39</code></li>
-              <li>整块 5 个全中：<code>520 / 951 = 54.7%</code></li>
-              <li>含 bonus / correction 的每步平均提交长度：约 <code>4.39</code> token</li>
-            </ul>
-
             <div class="callout callout-warn">
-              <span class="callout-label">接受率口径必须对齐后才能比</span>
-              不同测试工具统计接受率的方式不同，数值可以差出十几个百分点。跨工具、跨框架比接受率之前，
-              必须先确认分子分母的定义一致，否则结论不成立。比性能时更稳的口径是<strong>单步成本</strong>
-              （<code>TPOT × (1 + γ × 接受率)</code>），而不是直接比 TPOT。
+              <span class="callout-label">哪些是确证的，哪些是推断</span>
+              <p>
+                <b>官方 config 可查</b>：V4.1 draft 128 routed / top-3；V4.1 主模型 384 routed / top-6；
+                <code>dspark_target_layer_ids=[37,38,39]</code>；V4-Flash config <strong>没有</strong>独立的 draft 专家字段。
+              </p>
+              <p>
+                <b>推断（未经官方确认）</b>：V4 的 draft 沿用主模型 256 / top-6 的几何。
+                如果这条推断成立，那么 V4.1 的 draft 比 V4 代<strong>更小</strong>，
+                draft 的容量、延迟和显存占用都不同 —— 但算法流程不变。
+              </p>
+              <p>
+                训练配方（数据、loss 权重、token 数、学习率）不在本页范围。
+              </p>
             </div>
 
-            <h3>验证强度</h3>
+            <details>
+              <summary>术语对齐（展开）</summary>
+              <p>
+                <b>routed experts</b> = 每层可路由的专家数；<b>top-k</b> = 每个 token 激活几个专家；
+                <b>CE</b> = 交叉熵（学下一个 token）；<b>TV</b> = 让 draft 分布接近 target 分布，直接提高接受率；
+                <b>confidence</b> = 用公式算出的期望接受率监督置信度头；
+                <b>STS</b> = Sequential Temperature Scaling，在留出集上逐位置做温度缩放，把累积存活概率校准到实测接受率；
+                <b>mHC</b> = 把残差流扩成 4 路副本、用 Sinkhorn 归一化矩阵混合的超连接（见 <a href="../arch/#mhc">架构页</a>）；
+                <b>W</b> = 一次 draft 的块宽（本模型 5）；<b>MTP</b> = 多 token 预测（上一代串行方案）；
+                <b>梯度不回传</b> = DSpark 训练不改 backbone 参数。
+              </p>
+            </details>
+          </section>
+
+          <section class="section wide" id="opt1">
+            <span class="section-number">06</span>
+            <h2>优化 ① draft 成块执行：把 γ 个位置一次算完</h2>
+            <p class="section-note">第一刀不在图，而在几何。</p>
+
+            <p>
+              原先 draft 的 5 个位置被拆成 <strong>5 条单行序列</strong>分别下发（<code>q_len=1</code>，一行一个 token）。
+              每条都按"一个序列"处理，有两个问题：
+            </p>
             <ul>
-              <li><strong>已实测</strong>：上述 A3 单机 DP4 W8A8 条件下的 TPOT / 吞吐，以及 951 次提案的逐位置接受率。</li>
-              <li><strong>已知代价</strong>：同一组测试里 DSpark 抬高了 TTFT。</li>
-              <li><strong>未验证</strong>：多机部署、其他并发与长度组合、短输出的盈亏平衡点。</li>
+              <li>窗口和掩码与训练时的块语义（块内双向可见）<strong>对不齐</strong>；</li>
+              <li>历史 KV gather 和 attention 要各做 5 遍。</li>
             </ul>
+            <p>改成一次提交一个完整的 5 行块：</p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>维度</th><th>成块前</th><th>成块后</th></tr></thead>
+                <tbody>
+                  <tr><td>query 几何</td><td><code>5 × q_len=1</code></td><td><code>1 × q_len=5</code></td></tr>
+                  <tr><td>历史 KV gather</td><td class="num">5 次</td><td class="num">1 次</td></tr>
+                  <tr><td>attention 外层循环</td><td class="num">5 次</td><td class="num">1 次</td></tr>
+                  <tr><td>可见窗口</td><td>逐行近似</td><td>尾 128 + 整个块，非因果</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              关键：<strong>5 个位置共享同一段上下文、块内非因果，才能一次算完。</strong>
+              这不是"把 5 次算得更快"，而是"把 5 次变成 1 次"。
+            </p>
+
+            <h3>实测</h3>
+            <div class="callout callout-info">
+              <span class="callout-label">测试条件</span>
+              昇腾 A3 · 并发 <b>4</b>（与后两项的 c=1 <strong>不同</strong>）· γ=5 · MC2 关 · draft eager（未入图）· 每组 16 请求。
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>指标</th><th class="num">改前</th><th class="num">改后</th><th class="num">Δ</th></tr></thead>
+                <tbody>
+                  <tr><td>每步步长</td><td class="num">115.9 ms</td><td class="num">89.8 ms</td><td class="num"><b>−22.5%</b></td></tr>
+                  <tr><td>服务端 TPOT</td><td class="num">29.0 ms</td><td class="num">22.9 ms</td><td class="num"><b>−21%</b></td></tr>
+                  <tr><td>加权接受率</td><td class="num">0.641</td><td class="num">0.645</td><td class="num">持平</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">这组数字最重要的信息不是 −22.5%</span>
+              而是<strong>接受率没有明显变化</strong>。收益来自少做重复工作，不是牺牲接受率换的。
+              但注意：每组只有 16 个请求，<code>0.641 → 0.645</code> 的差异在这个样本量内<strong>不可区分</strong>。
+              只能说"没观察到下降"，<strong>不能说"提升"</strong>。
+            </div>
+          </section>
+
+          <section class="section wide" id="opt2">
+            <span class="section-number">07</span>
+            <h2>优化 ② target MoE 开 MC2：把通信融进计算</h2>
+
+            <p>
+              成块之后（draft 仍是 eager 逐算子执行），一步的大头是 target verify。
+              verify 的 MoE 层要做 all-to-all 通信：把 token 发给各专家（dispatch），再收回来（combine）。
+              MC2 把这两步通信和专家计算融在一起，减少单独等通信的时间。
+              <strong>它只作用于 target，draft 不参与。</strong>
+            </p>
+
+            <div class="callout callout-info">
+              <span class="callout-label">draft 为什么不能用 MC2</span>
+              draft 在各 DP 分片上的行数<strong>天然不等</strong>：有请求的分片跑整块（5 行/序列），
+              空闲分片只跑 1 行占位（dummy row）。
+              MC2 的 decode 路径假设各分片行数相等，否则跨分片写入会乱。所以 draft 不开 MC2，target 侧照常开。
+            </div>
+
+            <h3>实测</h3>
+            <div class="callout callout-info">
+              <span class="callout-label">测试条件</span>
+              昇腾 A3 · γ=5 · 并发 <b>1</b> · draft 未入图（eager）。
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>指标</th><th class="num">MC2 关</th><th class="num">MC2 开</th><th class="num">Δ</th></tr></thead>
+                <tbody>
+                  <tr><td>TPOT</td><td class="num">21.64 ms</td><td class="num">20.91 ms</td><td class="num">−3.4%</td></tr>
+                  <tr><td>出词吞吐</td><td class="num">45.44 tok/s</td><td class="num">46.87 tok/s</td><td class="num">+3.1%</td></tr>
+                  <tr><td>每步时间</td><td class="num">88.2 ms</td><td class="num">83.8 ms</td><td class="num">−4.4 ms</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <strong>两组结果的分布有重叠，属小幅收益，建议补重复测量。</strong>
+              单步降 5.0% 而 TPOT 只降 3.4%，是因为两组的接受长度略有差异
+              （<code>88.2/21.64 ≈ 4.08</code>，<code>83.8/20.91 ≈ 4.01</code>）。
+            </p>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">边界</span>
+              MC2 只换 MoE 层的通信，<strong>不覆盖 attention 层的并行 all-reduce</strong>；
+              它是配置级优化，不是 DSpark 专属。
+              部署时要按最大图 batch 预留通信缓冲（本案例 512 MB 量级）：
+              <strong>缓冲不够，图捕获阶段会直接报错。</strong>
+            </div>
+          </section>
+
+          <section class="section wide" id="opt3">
+            <span class="section-number">08</span>
+            <h2>优化 ③ draft 入图：把 body + LM head + γ 步 Markov 整体捕获</h2>
+            <p class="section-note">
+              draft 的瓶颈不在"算"，在"发"。把 3 层前向 + LM head + 5 步 Markov 采样一起录成一张固定形状的 ACL 图，之后每步只回放一次。
+            </p>
+
+            <figure>
+              <svg viewBox="0 0 860 268" role="img" aria-label="draft 入图后图内与图外的划分" class="dg">
+                <text class="dg-t" x="18" y="20">图内 = 录进这张图，回放时一次执行</text>
+                <rect class="dg-box-good" x="18" y="32" width="404" height="130" rx="6" />
+                <rect class="dg-box-accent" x="34" y="48" width="372" height="30" rx="4" />
+                <text class="dg-t" x="46" y="68">① draft body：3 层纯 SWA 前向</text>
+                <rect class="dg-box-accent" x="34" y="84" width="372" height="30" rx="4" />
+                <text class="dg-t" x="46" y="104">② draft LM head：hidden → 全词表 logits</text>
+                <rect class="dg-box-accent" x="34" y="120" width="372" height="30" rx="4" />
+                <text class="dg-t" x="46" y="140">③ γ 步 Markov：bias + argmax，逐位串行</text>
+
+                <text class="dg-t" x="438" y="20">图外 = 仍由 host 逐步发起</text>
+                <rect class="dg-box" x="438" y="32" width="404" height="130" rx="6" />
+                <rect class="dg-box-dim" x="454" y="48" width="372" height="24" rx="4" />
+                <text class="dg-t-sm" x="466" y="64">① context KV 注入（数据相关的写入）</text>
+                <rect class="dg-box-amber" x="454" y="76" width="372" height="24" rx="4" />
+                <text class="dg-t-sm" x="466" y="92">② target verify　← 整步的大头，约 55 ms</text>
+                <rect class="dg-box-dim" x="454" y="104" width="372" height="24" rx="4" />
+                <text class="dg-t-sm" x="466" y="120">③ 接受判定与纠错</text>
+                <rect class="dg-box-dim" x="454" y="132" width="372" height="24" rx="4" />
+                <text class="dg-t-sm" x="466" y="148">④ 下一步输入构造</text>
+
+                <rect class="dg-box-dim" x="18" y="178" width="824" height="82" rx="6" />
+                <text class="dg-t" x="34" y="200">为什么 Markov 链能进图？</text>
+                <text class="dg-t-sm" x="34" y="222">5 步虽然有先后依赖，但每一步都只在设备上算：一次 embedding、一次线性、一次 argmax。</text>
+                <text class="dg-t-sm" x="34" y="240">不需要把结果读回 host，也不需要跨卡通信（greedy 前提下）。有 host 依赖的循环进不了图，这个没有。</text>
+              </svg>
+              <figcaption>
+                这张图<strong>只覆盖 draft</strong>。它解决的是"draft 发得慢"，不是"verify 算得慢" ——
+                verify 的 55.3 ms 是主模型工作量，跟 draft 优化无关。
+              </figcaption>
+            </figure>
+
+            <h3>结果</h3>
+            <div class="callout callout-info">
+              <span class="callout-label">测试条件</span>
+              昇腾 A3 · γ=5 · greedy · 并发 <b>1</b>。
+            </div>
+            <div class="facts">
+              <div>
+                <span>单并发 TPOT</span>
+                <b>20.91 → 15.3 ms</b>
+                <span>−26.8%</span>
+              </div>
+              <div>
+                <span>每步 draft 设备时间</span>
+                <b>5.3 ms</b>
+                <span>图内 body + LM head + Markov</span>
+              </div>
+              <div>
+                <span>整步时间（profile）</span>
+                <b>79.7 ms</b>
+                <span>其中 verify 55.3 ms 是大头</span>
+              </div>
+            </div>
+            <p>
+              <strong>TPOT 来自压测，79.7 / 55.3 / 5.3 ms 来自另一次 profile（单分片），两者不是同一次测量。</strong>
+            </p>
+
+            <h3>三个关键设计</h3>
+            <ul class="steps">
+              <li>
+                <h4>① 导出仍按"每行一个 token"</h4>
+                <p>
+                  执行器仍然按一行一个 token 导出，注意力后端再把这 5 行重新拼成一个 5 行块。
+                  这样执行器的原有假设不用改。
+                </p>
+              </li>
+              <li>
+                <h4>② 按"完整块"补齐，而不是按 token</h4>
+                <p>
+                  图是固定形状的，所以按<strong>序列桶</strong>补齐：<code>token_rows = 序列桶 × γ</code>。
+                  例如 DP4、<code>max_seqs=32</code> 时每 rank 最多 8 个序列，桶是 1/2/4/8 → 5/10/20/40 行；
+                  DP2 同配置每 rank 16 个序列，会多一个 16 → 80 行。
+                  <strong>桶集合随 DP 和 max_seqs 变化，不是固定四种。</strong>
+                  draft 按 sequence 补、target 按 token 行补，<strong>两套桶不能混用</strong>。
+                </p>
+              </li>
+              <li>
+                <h4>③ 不支持就拒绝，不静默降级</h4>
+                <p>
+                  启动时检查：ACL 图、greedy、CP=1、全词表、draft 已加载自己的 head 权重、非 adaptive。
+                  带 penalties（采样惩罚）或 JSON 约束的请求在<strong>准入阶段直接拒绝并返回错误</strong>。
+                  图执行异常也直接报错不降级 —— KV 和运行状态可能已经改了一半，不能假定可以安全重试。
+                </p>
+              </li>
+            </ul>
+          </section>
+
+          <section class="section wide" id="prelaunch">
+            <span class="section-number">09</span>
+            <h2>下一步 prelaunch：把下一轮 draft 先排进去，再等 accepted</h2>
+
+            <p>
+              三项优化之后，一步里还剩一段 host 空等，记作 <code>H</code>：
+              verify 结束后，host 要等 accepted（target 接受的 token）从设备回到 host（D2H），
+              再修输入、建 draft 的 attention metadata、提交 draft 图 —— 这段时间设备闲着。
+            </p>
+            <p>
+              prelaunch 把下一轮 draft 提前排进设备队列，draft 的输入改在设备上生成，让 host 的准备和 verify 重叠。
+              论文 §5.2 的生产系统用的是同类思路：Zero-Overhead Scheduling 要求下一步的 batch 在当前步完成前就确定，调度器因此改为异步。
+            </p>
+
+            <h3>收益模型：V、D、H 分别是什么</h3>
+            <div class="facts">
+              <div><span>verify（V）</span><b>55.3 ms</b><span>设备时间，不可省</span></div>
+              <div><span>draft（D）</span><b>5.3 ms</b><span>设备时间，已经在图里</span></div>
+              <div><span>host 空泡（H）</span><b>≤ 19 ms</b><span>上界，<strong>未实测</strong></span></div>
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">19 ms 是上界，不是 H 的实测值</span>
+              <code>19.1 = 79.7 − 55.3 − 5.3</code> 是 profile 的差值。
+              这个差里还含 context KV 写、图间空泡、engine host 开销，<strong>不是 H 本身</strong>。
+              先用 host 时间戳把 H 量出来，再决定 prelaunch 值不值得做。
+            </div>
+
+            <p>
+              draft 能开始执行要同时满足两个条件：verify 完成（<code>V</code>）和 host 把 draft 排进队列（<code>H</code>），
+              所以开始时间是 <code>max(V, H)</code>，优化后一步总时间 <code>T' = max(V, H) + D</code>。
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>情形</th><th>T'</th><th>被藏掉</th><th>增益</th></tr></thead>
+                <tbody>
+                  <tr><td><code>H &lt; V</code>（预期）</td><td><code>V + D</code></td><td><code>H</code></td><td><code>H</code></td></tr>
+                  <tr><td><code>H &gt; V</code></td><td><code>H + D</code></td><td><code>V</code></td><td><code>V</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              <code>H</code> 的上界 19 ms 远小于 <code>V</code>（55 ms），所以预期是第一种：H 被 verify 完全盖住，收益就是 H。
+            </p>
+
+            <h3>前置条件（对照 xLLM main）</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>前置</th><th>现状</th></tr></thead>
+                <tbody>
+                  <tr><td>框架开关</td><td>main 已有 DSpark prelaunch 框架（<code>--enable_dspark_prelaunch</code>，Qwen3.5 DSpark 已支持）</td></tr>
+                  <tr><td>draft 长度 / 位置 / 槽位设备化</td><td><b>关键工作</b>：把这些值放到设备上算，host 不再回读。V4.1 当前仍以 host 值为准，提前提交会用<strong>旧值</strong></td></tr>
+                  <tr><td>模型声明设备输入</td><td>V4.1 DSpark 还没实现 <code>supports_device_only_decode_inputs</code>（默认 False），所以当前开不了 prelaunch</td></tr>
+                  <tr><td>运行约束</td><td>greedy、CP=1、schedule overlap 开、PD 分离关、KV split=1、非 adaptive；带 JSON / 惩罚的请求直接报错不回退</td></tr>
+                  <tr><td>请求结束 / EOS / stop / 缓存复用等边界</td><td>需专项验证</td></tr>
+                  <tr><td>与 draft 入图组合</td><td>main 上启动检查<strong>直接互斥</strong>；组合需要图输入也设备化</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">不是"把 D2H 去掉"就行</span>
+              D2H 只是症状（把 accepted 从设备拷回 host）。
+              真正卡住的是 <strong>draft 的 attention metadata 还在 host 上算</strong>。
+              长度 / 位置 / 槽位不设备化，提前提交就会用旧值，先出<strong>正确性</strong>问题。
+            </div>
+
+            <h3>prelaunch 与 draft 入图：作用在不同的 host 开销上</h3>
+            <p>
+              prelaunch 不是入图的替代品。入图省掉的是 draft 逐算子下发的 host 开销；
+              prelaunch 要藏的是入图<strong>之后仍然存在</strong>的 H。入图没有消掉这两段，所以两者可以叠加。
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>组合</th><th>谁省掉什么</th><th>预期</th><th>建议</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>只入图（当前）</td>
+                    <td>消掉 draft 的逐算子下发；H 仍在</td>
+                    <td>已落地，TPOT 20.91 → 15.3 ms（c=1）</td>
+                    <td><b>保留：确定性最高</b></td>
+                  </tr>
+                  <tr>
+                    <td>只 prelaunch（关图）</td>
+                    <td>把 eager 的 H 藏到 verify 后面</td>
+                    <td>净收益 ≈ 藏起的 eager H − 放弃的图收益（约 5.6 ms/token），<strong>可能为负</strong></td>
+                    <td>不作为首选</td>
+                  </tr>
+                  <tr>
+                    <td>入图 + prelaunch</td>
+                    <td>入图消掉下发开销，prelaunch 藏住 H</td>
+                    <td>增量 = 入图后的 H（≤19 ms/步，未实测）</td>
+                    <td><b>目标形态</b>，需图输入也设备化</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              <strong>正确顺序</strong>：入图（已做）→ draft 设备 metadata → 量出 H → prelaunch 验证 → 图 + prelaunch。
+              如果 H 只有 2–3 ms，prelaunch 的收益有限，优先级应让给接受率优化。
+            </p>
           </section>
 
           <section class="section wide" id="limits">
-            <span class="section-number">05</span>
-            <h2>当前实现的边界</h2>
-            <ul>
-              <li>验证长度固定 5，<strong>没有置信度调度器</strong>。</li>
-              <li>不支持 <code>cp_size &gt; 1</code>。</li>
-              <li>端到端验证目前集中在 Atlas A3 单机 DP4 W8A8。</li>
-              <li>原生 DSpark 稀疏注意力模式需要显式的算子支持，默认走兼容模式。</li>
-              <li>额外的草稿权重、KV cache、图状态和 workspace 都会增加显存占用。</li>
-              <li>不支持缩减词表的 DSpark checkpoint。</li>
+            <span class="section-number">10</span>
+            <h2>适用边界与常见问题</h2>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>项</th><th>当前边界</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>采样 / 并行</td>
+                    <td>greedy；CP=1；全词表 draft；整图要求 draft 加载自己的 head 权重；不支持 penalties / JSON_OBJECT / adaptive（整图路径下这类请求被拒绝）</td>
+                  </tr>
+                  <tr>
+                    <td>性能结论</td>
+                    <td>入图和 MC2 只有单并发（c=1）数据，成块是 c=4。<strong>多并发、H 实测和 prelaunch 的正式复测是下一步</strong></td>
+                  </tr>
+                  <tr>
+                    <td>平台</td>
+                    <td>昇腾 A3。<strong>A5 需要重新确认 page size、算子与图捕获约束</strong></td>
+                  </tr>
+                  <tr>
+                    <td>收益口径</td>
+                    <td>三项优化来自不同测试条件，不能相乘 / 相加；15.3 ms（压测）与 79.7 ms（profile）也不是同一次测量。引用时必须带条件</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              这些是<strong>当前实现的支持边界，不是模型能力边界</strong>。
+            </p>
+
+            <h3>三个常见问题</h3>
+            <ul class="steps">
+              <li>
+                <h4>为什么块并行不掉质量？</h4>
+                <p>
+                  输出质量由 target 验证保证：greedy 下接受的都是 target 自己会选的 token，
+                  输出和只跑 target 逐 token 一致（<strong>无损</strong>）。
+                  块并行和 Markov 头只影响接受长度，也就是速度。
+                </p>
+              </li>
+              <li>
+                <h4>入图会不会改变数值？</h4>
+                <p>
+                  图是把同一串算子录下来之后一次播放，理论上不改变计算；
+                  但图融合和执行顺序仍可能带来数值差异，<strong>所以上生产前会做标准数据集的精度对齐</strong>。
+                </p>
+              </li>
+              <li>
+                <h4>prelaunch 能带来多少？</h4>
+                <p>
+                  上限是入图之后剩下的 H（profile 上界 19 ms/步，<strong>未实测</strong>）。
+                  先用 host 时间戳量出 H，再决定是否投入；<strong>H 小于 2–3 ms 就不值得做</strong>。
+                </p>
+              </li>
             </ul>
 
-            <div class="callout callout-warn">
-              <span class="callout-label">图模式下的一个坑</span>
-              稀疏注意力的 metadata 必须在每次图回放前刷新。移植时如果漏掉这一步，图里会一直用 warmup 时的 dummy 值，
-              表现为<strong>只在图模式下输出乱码</strong>，同时接受率掉到个位数 —— 两个症状同源。
+            <div class="callout callout-info">
+              <span class="callout-label">如果只记一件事</span>
+              draft 侧的瓶颈不在"算"，而在"发"。
+              把 draft 的 3 层前向、LM head 和 5 步 Markov 链整体录进一张图，单并发 TPOT 从 20.91 降到 15.3 ms。
+              整步的大头仍是 verify（约 55 ms）。
+              下一步 prelaunch 把 verify 之后的 host 空等藏进 verify，<strong>收益上限是 H，要先实测</strong>。
             </div>
           </section>
 
           <section class="section" id="refs">
-            <span class="section-number">06</span>
+            <span class="section-number">11</span>
             <h2>参考资料</h2>
             <ul>
-              <li>DSpark 论文：<a href="https://arxiv.org/abs/2607.05147" target="_blank" rel="noreferrer">arxiv.org/abs/2607.05147</a></li>
-              <li>DFlash 论文：<a href="https://arxiv.org/abs/2602.06036" target="_blank" rel="noreferrer">arxiv.org/abs/2602.06036</a></li>
-              <li>DeepSpec 训练仓：<a href="https://github.com/deepseek-ai/DeepSpec" target="_blank" rel="noreferrer">deepseek-ai/DeepSpec</a></li>
-              <li>xLLM 适配 PR：<a href="https://github.com/xLLM-AI/xllm/pull/2172" target="_blank" rel="noreferrer">xLLM-AI/xllm#2172</a></li>
+              <li>
+                X. Cheng et al. <em>DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation.</em>
+                arXiv:2607.05147（§2.2 DFlash 骨干、§3 架构、§3.3 训练、§5 V4 部署）
+              </li>
+              <li>DeepSeek-AI. <em>DeepSeek-V4.1-Flash Technical Report</em>（§2.4.3 DSpark）</li>
+              <li>DeepSeek-AI. <em>DeepSeek-V4 Technical Report</em>（V4-Flash：256 routed / top-6，MTP 深度 1）</li>
+              <li>
+                DeepSeek-V4.1-Flash 官方 <code>config.json</code>：
+                <code>dspark_n_routed_experts=128</code>、<code>dspark_num_experts_per_tok=3</code>、
+                <code>dspark_target_layer_ids=[37,38,39]</code>
+              </li>
+              <li>
+                xLLM：<code>xllm/python/models/deepseek_v41_dspark.py</code>、
+                <code>xllm/models/llm/deepseek_v41_dspark_graph_policy.h</code>、
+                <code>xllm/core/runtime/dspark_worker_impl.cpp</code>
+              </li>
             </ul>
           </section>
 
           <nav class="pager" aria-label="相邻页面">
-            <a href="../flashcomm/"><span>上一页</span><b>← FlashComm</b></a>
-            <a href="../dsa-cp/"><span>下一页</span><b>DSA CP · 注意力并行 →</b></a>
+            <a href="../flashcomm/"><span>上一页</span><b>← FlashComm1</b></a>
+            <a href="../dsa-cp/"><span>下一页</span><b>DSA CP →</b></a>
           </nav>
         </div>
 
         <aside class="toc" aria-label="本页目录">
           <p>本页目录</p>
           <ol>
-            <li><a href="#tldr">结论与适用条件</a></li>
+            <li><a href="#tldr">一页读懂</a></li>
+            <li><a href="#principle">原理</a></li>
             <li><a href="#step">一次 decode step</a></li>
-            <li><a href="#kv">两套 KV 缓存</a></li>
-            <li><a href="#numbers">收益与验证强度</a></li>
-            <li><a href="#limits">实现边界</a></li>
+            <li><a href="#draft">draft 模型结构</a></li>
+            <li><a href="#versions">V4 → V4.1</a></li>
+            <li><a href="#opt1">优化① draft 成块</a></li>
+            <li><a href="#opt2">优化② target MC2</a></li>
+            <li><a href="#opt3">优化③ draft 入图</a></li>
+            <li><a href="#prelaunch">下一步 prelaunch</a></li>
+            <li><a href="#limits">边界与常见问题</a></li>
             <li><a href="#refs">参考资料</a></li>
           </ol>
         </aside>
@@ -322,7 +884,7 @@
     <footer class="site-footer">
       <div class="shell">
         <p><a href="../">← 回到特性列表</a></p>
-        <p>性能与接受率数字只在本页标注的测试条件与统计口径下成立。</p>
+        <p>数据为特定测试条件（A3、γ=5、greedy；成块 c=4，MC2 / 入图 c=1）。不同条件不可直接相加。</p>
       </div>
     </footer>
   </body>

@@ -6,7 +6,7 @@
     <title>DeepSeek-V4.1-Flash 模型结构｜xLLM 特性解读</title>
     <meta
       name="description"
-      content="DeepSeek-V4.1-Flash 模型结构：40 层 CED 主干、CSA2 跨层共享 KV、分层稀疏索引、Single-Pass mHC、Engram 查表、KV 缓存族与昇腾上的实际字节数。"
+      content="DeepSeek-V4.1-Flash 模型结构：40 层 CED 主干、CSA2 跨层共享 KV、分层稀疏索引、Single-Pass mHC、Engram 条件记忆、DSpark、ViT，以及 KV 缓存归属、量化分配与 V4 到 V4.1 的结构差异。两条口径分开写：论文口径与实现口径。"
     />
     <meta name="color-scheme" content="light dark" />
     <link rel="stylesheet" href="../assets/site.css" />
@@ -21,7 +21,7 @@
         <nav class="topnav" aria-label="特性导航">
           <a href="../">首页</a>
           <a href="../arch/" aria-current="page">V4.1 架构</a>
-          <a href="../flashcomm/">FlashComm</a>
+          <a href="../flashcomm/">FlashComm1</a>
           <a href="../dspark/">DSpark</a>
           <a href="../dsa-cp/">DSA CP</a>
           <a href="../swa-replay/">SWA 回放</a>
@@ -37,567 +37,1104 @@
     <main id="main">
       <section class="hero">
         <div class="shell">
-          <p class="eyebrow">00 / 模型架构 · 基础读物</p>
-          <h1>DeepSeek-V4.1-Flash 的 40 层，是怎么把长上下文成本压成常数的</h1>
+          <p class="eyebrow">01 / 模型结构</p>
+          <h1>DeepSeek-V4.1-Flash 模型结构</h1>
           <p class="hero-lede">
-            这一页讲清三件事：这个模型的层栈长什么样、它的「记忆」分成哪几份、每份在昇腾上占多少字节。
-            读完你应该能回答：为什么 40 层里只有 4 层持有全局 KV，为什么 decode 的计算量从 4K 到 1M 只涨约四分之一，
-            以及推理框架必须为它做哪些改动。
+            这一页是其余几页的术语基础。它只做一件事：把这个模型的结构讲清楚，
+            并且<strong>始终分开两条口径</strong> —— <b>论文口径</b>（技术报告的设计意图）与
+            <b>实现口径</b>（代码里实际怎么跑）。两者在好几处不一致，混用会得出错误结论。
+            覆盖 CSA2 注意力、Compressor、Indexer、分层稀疏索引、mHC、Engram、DSpark 与多模态。
           </p>
           <ul class="chips">
-            <li class="chip chip-good">官方 reference 与 vLLM 实现已核对</li>
-            <li class="chip chip-warn">昇腾字节数为推算，未在机器上实测</li>
+            <li class="chip chip-info">40 层 CED 主干</li>
+            <li class="chip chip-info">主干 552B + Engram 196B</li>
+            <li class="chip chip-info">hidden 5120 · 64 heads · head_dim 512</li>
+            <li class="chip chip-info">SWA 窗口 128</li>
+            <li class="chip chip-warn">部分昇腾字节数为推算</li>
           </ul>
         </div>
       </section>
 
       <div class="shell doc">
         <div class="doc-main">
-          <section class="section" id="overview">
+          <section class="section" id="tldr">
             <span class="section-number">01</span>
             <h2>一页读懂</h2>
-            <p class="section-note">先给结论，细节在后面各节。</p>
 
-            <div class="facts">
-              <div><b>552B + 196B</b><span>主干参数 + Engram 查表参数</span></div>
-              <div><b>~8B / ~16B</b><span>每 token 激活：prefill / decode</span></div>
-              <div><b>1M</b><span>支持的上下文长度，原生图文输入</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>项</th><th>要点</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>主干</b></td>
+                    <td>40 层 CED（Causal Encoder-Decoder）：论文口径为前 20 层 causal encoder + 后 20 层 decoder；<strong>实现为单一顺序执行</strong>（见<a href="#ced">第 2 节</a>）</td>
+                  </tr>
+                  <tr>
+                    <td><b>参数 / 激活</b></td>
+                    <td>主干 552B + Engram 196B；MoE 按 token 激活部分专家，激活参数 prefill 约 8B、decode 约 16B（论文口径）</td>
+                  </tr>
+                  <tr>
+                    <td><b>CSA2 稀疏注意力</b></td>
+                    <td>每层自算局部 SWA KV（窗口 128）；全局 main KV <strong>只由 4 个 Full 层生成</strong>、被后续各层复用</td>
+                  </tr>
+                  <tr>
+                    <td><b>分层稀疏索引</b></td>
+                    <td>第 20 层建块级候选池；深层 Reindex 只在池内选 Top-512，索引成本与上下文长度解耦</td>
+                  </tr>
+                  <tr>
+                    <td><b>配套机制</b></td>
+                    <td>mHC 四流残差 · Engram n-gram 查表 · <a href="../dspark/">DSpark 投机解码</a></td>
+                  </tr>
+                  <tr>
+                    <td><b>注册名</b></td>
+                    <td><code>DeepseekV41ForCausalLM</code>；词表 <code>vocab_size = 129280</code></td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
 
-            <p>
-              V4.1-Flash 是一个 MoE 模型。主干 40 层，论文把这个组织方式叫 <strong>Causal Encoder-Decoder（CED）</strong>：
-              前 20 层称 encoder，后 20 层称 decoder。但它不是 T5 那种 encoder-decoder，它仍然是从左到右生成的 decoder-only 模型，
-              代码里就是 40 层顺序执行。叫 CED 的原因见 <a href="#ced">第 3 节</a>。
-            </p>
-            <p>
-              最核心的改动在注意力，叫 <strong>CSA2</strong>。一句话：<strong>每层都自己算最近 128 个 token 的滑窗 KV；
-              但全局的 KV，40 层里只有 4 层生成，其他层直接复用。</strong>
-            </p>
-            <p>
-              官方给的效果是：上下文从 4K 增长到 1M（256 倍），单 token decode 的计算量只增长约四分之一；
-              全局 KV 每 token 890 字节，约为 V4-Flash 的四分之一。
-            </p>
-
-            <div class="callout callout-info">
-              <span class="callout-label">贯穿全文的一个目标</span>
-              把随上下文长度增长的成本，尽量变成和长度无关的常数。CED 砍 prefill 的层数，CSA2 加分层索引砍 decode 的显存和索引计算，
-              FP4 砍 main KV 的字节数。
-            </div>
-
-            <div class="callout callout-bad">
-              <span class="callout-label">常见误解</span>
-              不要说「它是 encoder-decoder 架构，所以要两套 KV」。它只有一条顺序执行的层栈，没有独立的 encoder/decoder 两个模块。
-            </div>
-          </section>
-
-          <section class="section" id="forward">
-            <span class="section-number">02</span>
-            <h2>一次前向走什么路径</h2>
-            <p class="section-note">从输入到 logits，先把顺序对齐，后面才好定位每个特性落在哪一段。</p>
-
-            <ol class="steps">
+            <h3>两件事决定了它为什么省</h3>
+            <ul class="steps">
               <li>
-                <h4>输入变向量</h4>
+                <h4>两路 KV 与跨层复用</h4>
                 <p>
-                  文本 token 查词表（词表 129280）。图片经 DeepSeek-ViT 编码，再用 3×3 pixel-unshuffle 把视觉 token 数降到九分之一，
-                  拼进同一条序列。
+                  每层都有局部 SWA KV（窗口 128）；全局 main KV 由 4 个 Full 层生成 ——
+                  前 3 个（第 2 / 8 / 14 层）按 2:1 压缩，第 20 层 <code>ratio 1</code> 不压缩（未压缩直投）。
+                  其余层按「是否自持 KV」「是否自建索引」组合成三种角色。
+                  <strong>40 层里只有 4 层自持 main KV。</strong>
                 </p>
               </li>
               <li>
-                <h4>Engram 先算哈希</h4>
-                <p>进层之前，把这条序列要查的 n-gram 哈希一次算好，后面层里只取用。见 <a href="../engram-offload/">Engram 卸载</a>。</p>
+                <h4>分层稀疏索引</h4>
+                <p>
+                  第 20 层建块级候选池（每 8 个位置一 block，取 Top-2048 块），深层 Reindex 只在池内选 Top-512。
+                  索引成本由候选池上限决定，与上下文长度解耦。
+                  <strong>注意：4 个 Full 层仍对完整可见上下文打分</strong> ——
+                  只有第 24 层起的 Reindex 才被候选池约束。
+                </p>
               </li>
-              <li>
-                <h4>过 40 层</h4>
-                <p>每层固定两个子块：注意力和 MoE，都夹在 mHC 的残差流之间。</p>
-              </li>
-              <li>
-                <h4>出 logits</h4>
-                <p>最后过 RMSNorm 和 LM head。生成阶段可以挂 <a href="../dspark/">DSpark</a> 做推测解码。</p>
-              </li>
-            </ol>
+            </ul>
 
-            <div class="callout">
-              <span class="callout-label">记住一件事</span>
-              注意力有<strong>两份记忆</strong>。一份是<strong>局部 SWA KV</strong>，每层自己算，只保留最近 128 个 token；
-              另一份是<strong>全局 main KV</strong>，只有少数层生成，其他层复用。后面所有内容都在讲第二份记忆怎么生成、怎么复用、怎么检索。
+            <div class="callout callout-info">
+              <span class="callout-label">论文 Figure 2 的那条曲线说明什么</span>
+              上下文从 4K 增至 1M（256 倍）时，V4.1-Flash 的单 token decode FLOPs 仅约增加 1/4（论文口径，
+              按 BF16 / FP8 / FP4 = 1 / 0.5 / 0.25 加权）。
+              这是上面两件事叠加的结果，远小于前几代。
+            </div>
+          </section>
+
+          <section class="section wide" id="forward">
+            <span class="section-number">02</span>
+            <h2>一次前向：从输入到输出</h2>
+            <p class="section-note">先用大白话走一遍整条路径，再往下看细节。</p>
+
+            <ul class="steps">
+              <li>
+                <h4>① 文本和图片都变成向量</h4>
+                <p>
+                  每个文本 token 查词表（129280）变成一条向量。
+                  图片由 DeepSeek-ViT 编码，<code>3×3</code> pixel-unshuffle 把视觉 token 数降到 1/9，
+                  再由 Aligner 映射到主干维度。图片向量放到对应位置，和文本向量拼成<strong>同一条</strong>输入序列。
+                </p>
+              </li>
+              <li>
+                <h4>② 进层前：Engram 先把「要查哪些 n-gram」一次算好</h4>
+                <p>避免每一层重复做同样的哈希计算；层内只按需取用。</p>
+              </li>
+              <li>
+                <h4>③ 主干：40 层，每层重复同一套动作</h4>
+                <p>
+                  每层 = 注意力（CSA2）+ MoE（1 共享 + 384 路由 / top-6），两者都夹在 mHC 残差流之间。
+                  理解注意力的关键是<strong>它有两份记忆</strong>：
+                  <b>局部记忆（SWA KV）</b>每层自己算、只看最近 128 个 token；
+                  <b>全局记忆（main KV）</b>只有少数几层生成、其它层直接复用。
+                  CSA2 省显存省算力，靠的就是第二种「共享 + 复用」。
+                </p>
+              </li>
+              <li>
+                <h4>④ 输出：预测下一个词</h4>
+                <p>最后一层输出经 RMSNorm → LM head，得到整个词表上的分数。</p>
+              </li>
+              <li>
+                <h4>⑤ 生成阶段：DSpark 投机解码</h4>
+                <p>用一个独立的小草稿模型一次多猜几个 token，交主模型批量验证。详见 <a href="../dspark/">DSpark 页</a>。</p>
+              </li>
+            </ul>
+
+            <h3 id="ced">CED 在实现里怎么体现</h3>
+            <p>
+              这是两条口径第一次分叉，也是最容易误读的一处。
+            </p>
+            <div class="callout callout-warn">
+              <span class="callout-label">代码里没有 encoder / decoder 两个类</span>
+              <p>
+                40 层是<strong>同一个 ModuleList 的顺序循环</strong>，没有单独的 encoder / decoder 模块，
+                也没有额外的跨层投影分支。
+              </p>
+              <p>
+                <strong>但这不等于 CED 不存在。</strong>技术报告 §2.3.1 写明：
+                「CED 与 CSA2 结合时，decoder 中的 Full 层用第 <code>L/2</code> 层（encoder 末层）的 hidden 计算自己的全局 KV」。
+                而第 20 层 —— decoder 里第一个、也是唯一的 Full 层 —— 的输入<strong>正是第 19 层的输出</strong>，
+                其后第 21–39 层全部复用这份 KV。
+                <strong>顺序执行天然满足论文公式，不需要额外的投影分支。</strong>
+              </p>
+              <p>
+                真正依赖额外实现的是另一条省算路径：prefill 时 prompt 主体只跑前 20 层，
+                decoder 只回放最近若干 token 补滑窗 —— 那是
+                <a href="../swa-replay/">SWA Bounded Replay</a> 那一页的内容。
+              </p>
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">别说这句话</span>
+              <p><strong>别说</strong>「它是 encoder-decoder 架构，所以要两套 KV」。只有一条顺序执行的层栈，KV 的分组是按层角色来的，不是按 encoder / decoder。</p>
             </div>
           </section>
 
           <section class="section wide" id="layers">
             <span class="section-number">03</span>
-            <h2>40 层的四种角色</h2>
-            <p class="section-note">全片最重要的一页。层按「全局 KV 怎么来」分四类。</p>
+            <h2>40 层结构与角色分配</h2>
+            <p class="section-note">
+              实现侧用两个集合 + 「最近前驱」规则解析角色：
+              <code>kv_source_layer_ids</code> 上挂 Compressor 与压缩 KV 缓存，
+              <code>index_source_layer_ids</code> 上挂 Indexer；
+              消费者复用<strong>层号不大于自己</strong>的最近 source（<code>max(s ≤ layer_id)</code>）。
+            </p>
 
             <figure>
-              <svg viewBox="0 0 880 240" role="img" aria-label="DeepSeek-V4.1-Flash 40 层的角色分布：第 0、1 层纯 SWA；第 2、8、14、20 层为 Full；第 24、28、32、36 层为 Reindex；其余为 Reuse" class="dg">
-                <text class="dg-t" x="8" y="22">按「全局 KV 怎么来」给 40 层上色</text>
-                <g>
-                  <rect class="dg-box-dim" x="330" y="10" width="14" height="14" rx="3" /><text class="dg-t-sm" x="350" y="22">SWA-only</text>
-                  <rect class="dg-box-accent" x="420" y="10" width="14" height="14" rx="3" /><text class="dg-t-sm" x="440" y="22">Full</text>
-                  <rect class="dg-box-amber" x="480" y="10" width="14" height="14" rx="3" /><text class="dg-t-sm" x="500" y="22">Reindex</text>
-                  <rect class="dg-box" x="560" y="10" width="14" height="14" rx="3" /><text class="dg-t-sm" x="580" y="22">Reuse</text>
-                </g>
-    <text class="dg-t-sm" x="8" y="86">encoder</text>
-    <rect class="dg-box-dim" x="46" y="66" width="38" height="30" rx="4" /><text class="dg-t-sm" x="65" y="86" text-anchor="middle">0</text>
-    <rect class="dg-box-dim" x="88" y="66" width="38" height="30" rx="4" /><text class="dg-t-sm" x="107" y="86" text-anchor="middle">1</text>
-    <rect class="dg-box-accent" x="130" y="66" width="38" height="30" rx="4" /><text class="dg-t-key" x="149" y="86" text-anchor="middle">2</text>
-    <rect class="dg-box" x="172" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="191" y="86" text-anchor="middle">3</text>
-    <rect class="dg-box" x="214" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="233" y="86" text-anchor="middle">4</text>
-    <rect class="dg-box" x="256" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="275" y="86" text-anchor="middle">5</text>
-    <rect class="dg-box" x="298" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="317" y="86" text-anchor="middle">6</text>
-    <rect class="dg-box" x="340" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="359" y="86" text-anchor="middle">7</text>
-    <rect class="dg-box-accent" x="382" y="66" width="38" height="30" rx="4" /><text class="dg-t-key" x="401" y="86" text-anchor="middle">8</text>
-    <rect class="dg-box" x="424" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="443" y="86" text-anchor="middle">9</text>
-    <rect class="dg-box" x="466" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="485" y="86" text-anchor="middle">10</text>
-    <rect class="dg-box" x="508" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="527" y="86" text-anchor="middle">11</text>
-    <rect class="dg-box" x="550" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="569" y="86" text-anchor="middle">12</text>
-    <rect class="dg-box" x="592" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="611" y="86" text-anchor="middle">13</text>
-    <rect class="dg-box-accent" x="634" y="66" width="38" height="30" rx="4" /><text class="dg-t-key" x="653" y="86" text-anchor="middle">14</text>
-    <rect class="dg-box" x="676" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="695" y="86" text-anchor="middle">15</text>
-    <rect class="dg-box" x="718" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="737" y="86" text-anchor="middle">16</text>
-    <rect class="dg-box" x="760" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="779" y="86" text-anchor="middle">17</text>
-    <rect class="dg-box" x="802" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="821" y="86" text-anchor="middle">18</text>
-    <rect class="dg-box" x="844" y="66" width="38" height="30" rx="4" /><text class="dg-t-mono" x="863" y="86" text-anchor="middle">19</text>
-    <text class="dg-t-sm" x="8" y="190">decoder</text>
-    <rect class="dg-box-accent" x="46" y="170" width="38" height="30" rx="4" /><text class="dg-t-key" x="65" y="190" text-anchor="middle">20</text>
-    <rect class="dg-box" x="88" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="107" y="190" text-anchor="middle">21</text>
-    <rect class="dg-box" x="130" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="149" y="190" text-anchor="middle">22</text>
-    <rect class="dg-box" x="172" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="191" y="190" text-anchor="middle">23</text>
-    <rect class="dg-box-amber" x="214" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="233" y="190" text-anchor="middle">24</text>
-    <rect class="dg-box" x="256" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="275" y="190" text-anchor="middle">25</text>
-    <rect class="dg-box" x="298" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="317" y="190" text-anchor="middle">26</text>
-    <rect class="dg-box" x="340" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="359" y="190" text-anchor="middle">27</text>
-    <rect class="dg-box-amber" x="382" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="401" y="190" text-anchor="middle">28</text>
-    <rect class="dg-box" x="424" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="443" y="190" text-anchor="middle">29</text>
-    <rect class="dg-box" x="466" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="485" y="190" text-anchor="middle">30</text>
-    <rect class="dg-box" x="508" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="527" y="190" text-anchor="middle">31</text>
-    <rect class="dg-box-amber" x="550" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="569" y="190" text-anchor="middle">32</text>
-    <rect class="dg-box" x="592" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="611" y="190" text-anchor="middle">33</text>
-    <rect class="dg-box" x="634" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="653" y="190" text-anchor="middle">34</text>
-    <rect class="dg-box" x="676" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="695" y="190" text-anchor="middle">35</text>
-    <rect class="dg-box-amber" x="718" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="737" y="190" text-anchor="middle">36</text>
-    <rect class="dg-box" x="760" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="779" y="190" text-anchor="middle">37</text>
-    <rect class="dg-box" x="802" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="821" y="190" text-anchor="middle">38</text>
-    <rect class="dg-box" x="844" y="170" width="38" height="30" rx="4" /><text class="dg-t-mono" x="863" y="190" text-anchor="middle">39</text>
-    <path class="dg-line" d="M46 100 v6 h80 v-6" />
-    <text class="dg-t-sm" x="86" y="120" text-anchor="middle">纯 SWA</text>
-    <path class="dg-line" d="M130 100 v6 h248 v-6" />
-    <text class="dg-t-sm" x="254" y="120" text-anchor="middle">Full 2 + 5×Reuse · ratio 2</text>
-    <path class="dg-line" d="M382 100 v6 h248 v-6" />
-    <text class="dg-t-sm" x="506" y="120" text-anchor="middle">Full 8 + 5×Reuse · ratio 2</text>
-    <path class="dg-line" d="M634 100 v6 h248 v-6" />
-    <text class="dg-t-sm" x="758" y="120" text-anchor="middle">Full 14 + 5×Reuse · ratio 2</text>
-    <path class="dg-line" d="M46 204 v6 h164 v-6" />
-    <text class="dg-t-sm" x="128" y="224" text-anchor="middle">Full 20 + 3×Reuse · ratio 1</text>
-    <path class="dg-line" d="M214 204 v6 h164 v-6" />
-    <text class="dg-t-sm" x="296" y="224" text-anchor="middle">Reindex 24</text>
-    <path class="dg-line" d="M382 204 v6 h164 v-6" />
-    <text class="dg-t-sm" x="464" y="224" text-anchor="middle">Reindex 28</text>
-    <path class="dg-line" d="M550 204 v6 h164 v-6" />
-    <text class="dg-t-sm" x="632" y="224" text-anchor="middle">Reindex 32</text>
-    <path class="dg-line" d="M718 204 v6 h164 v-6" />
-    <text class="dg-t-sm" x="800" y="224" text-anchor="middle">Reindex 36</text>
+              <svg viewBox="0 0 860 236" role="img" aria-label="40 层角色分配：第 0-1 层纯 SWA，第 2/8/14/20 层为 Full，第 24/28/32/36 层为 Reindex，其余为 Reuse；main KV 由 4 个 Full 层向后供给" class="dg">
+                <text class="dg-t" x="18" y="20">层角色与 main KV 供给关系</text>
+                <rect class="dg-box-accent" x="200" y="8" width="14" height="14" rx="3" />
+                <text class="dg-t-sm" x="220" y="20">F = Full</text>
+                <rect class="dg-box-amber" x="296" y="8" width="14" height="14" rx="3" />
+                <text class="dg-t-sm" x="316" y="20">R = Reindex</text>
+                <rect class="dg-box" x="406" y="8" width="14" height="14" rx="3" />
+                <text class="dg-t-sm" x="426" y="20">· = Reuse</text>
+                <rect class="dg-box-dim" x="504" y="8" width="14" height="14" rx="3" />
+                <text class="dg-t-sm" x="524" y="20">S = SWA-only</text>
+                <circle class="dg-fill-accent" cx="630" cy="15" r="3" />
+                <text class="dg-t-sm" x="642" y="20">Engram 注入层（第 1、14 层）</text>
+
+                <text class="dg-t-sm" x="18" y="80">Encoder</text>
+                <text class="dg-t-sm" x="18" y="94">层 0–19</text>
+                <rect class="dg-box-dim" x="80" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="97" y="80" text-anchor="middle">0</text>
+                <text class="dg-t-sm" x="97" y="93" text-anchor="middle">S</text>
+                <rect class="dg-box-dim" x="118" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="135" y="80" text-anchor="middle">1</text>
+                <text class="dg-t-sm" x="135" y="93" text-anchor="middle">S</text>
+                <circle class="dg-fill-accent" cx="147" cy="69" r="3" />
+                <rect class="dg-box-accent" x="156" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="173" y="80" text-anchor="middle">2</text>
+                <text class="dg-t-sm" x="173" y="93" text-anchor="middle">F</text>
+                <rect class="dg-box" x="194" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="211" y="80" text-anchor="middle">3</text>
+                <text class="dg-t-sm" x="211" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="232" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="249" y="80" text-anchor="middle">4</text>
+                <text class="dg-t-sm" x="249" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="270" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="287" y="80" text-anchor="middle">5</text>
+                <text class="dg-t-sm" x="287" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="308" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="325" y="80" text-anchor="middle">6</text>
+                <text class="dg-t-sm" x="325" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="346" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="363" y="80" text-anchor="middle">7</text>
+                <text class="dg-t-sm" x="363" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box-accent" x="384" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="401" y="80" text-anchor="middle">8</text>
+                <text class="dg-t-sm" x="401" y="93" text-anchor="middle">F</text>
+                <rect class="dg-box" x="422" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="439" y="80" text-anchor="middle">9</text>
+                <text class="dg-t-sm" x="439" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="460" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="477" y="80" text-anchor="middle">10</text>
+                <text class="dg-t-sm" x="477" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="498" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="515" y="80" text-anchor="middle">11</text>
+                <text class="dg-t-sm" x="515" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="536" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="553" y="80" text-anchor="middle">12</text>
+                <text class="dg-t-sm" x="553" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="574" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="591" y="80" text-anchor="middle">13</text>
+                <text class="dg-t-sm" x="591" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box-accent" x="612" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="629" y="80" text-anchor="middle">14</text>
+                <text class="dg-t-sm" x="629" y="93" text-anchor="middle">F</text>
+                <circle class="dg-fill-accent" cx="641" cy="69" r="3" />
+                <rect class="dg-box" x="650" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="667" y="80" text-anchor="middle">15</text>
+                <text class="dg-t-sm" x="667" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="688" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="705" y="80" text-anchor="middle">16</text>
+                <text class="dg-t-sm" x="705" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="726" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="743" y="80" text-anchor="middle">17</text>
+                <text class="dg-t-sm" x="743" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="764" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="781" y="80" text-anchor="middle">18</text>
+                <text class="dg-t-sm" x="781" y="93" text-anchor="middle">·</text>
+                <rect class="dg-box" x="802" y="64" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="819" y="80" text-anchor="middle">19</text>
+                <text class="dg-t-sm" x="819" y="93" text-anchor="middle">·</text>
+                <text class="dg-t-sm" x="18" y="166">Decoder</text>
+                <text class="dg-t-sm" x="18" y="180">层 20–39</text>
+                <rect class="dg-box-accent" x="80" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="97" y="166" text-anchor="middle">20</text>
+                <text class="dg-t-sm" x="97" y="179" text-anchor="middle">F</text>
+                <rect class="dg-box" x="118" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="135" y="166" text-anchor="middle">21</text>
+                <text class="dg-t-sm" x="135" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="156" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="173" y="166" text-anchor="middle">22</text>
+                <text class="dg-t-sm" x="173" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="194" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="211" y="166" text-anchor="middle">23</text>
+                <text class="dg-t-sm" x="211" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box-amber" x="232" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="249" y="166" text-anchor="middle">24</text>
+                <text class="dg-t-sm" x="249" y="179" text-anchor="middle">R</text>
+                <rect class="dg-box" x="270" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="287" y="166" text-anchor="middle">25</text>
+                <text class="dg-t-sm" x="287" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="308" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="325" y="166" text-anchor="middle">26</text>
+                <text class="dg-t-sm" x="325" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="346" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="363" y="166" text-anchor="middle">27</text>
+                <text class="dg-t-sm" x="363" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box-amber" x="384" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="401" y="166" text-anchor="middle">28</text>
+                <text class="dg-t-sm" x="401" y="179" text-anchor="middle">R</text>
+                <rect class="dg-box" x="422" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="439" y="166" text-anchor="middle">29</text>
+                <text class="dg-t-sm" x="439" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="460" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="477" y="166" text-anchor="middle">30</text>
+                <text class="dg-t-sm" x="477" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="498" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="515" y="166" text-anchor="middle">31</text>
+                <text class="dg-t-sm" x="515" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box-amber" x="536" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="553" y="166" text-anchor="middle">32</text>
+                <text class="dg-t-sm" x="553" y="179" text-anchor="middle">R</text>
+                <rect class="dg-box" x="574" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="591" y="166" text-anchor="middle">33</text>
+                <text class="dg-t-sm" x="591" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="612" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="629" y="166" text-anchor="middle">34</text>
+                <text class="dg-t-sm" x="629" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="650" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="667" y="166" text-anchor="middle">35</text>
+                <text class="dg-t-sm" x="667" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box-amber" x="688" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="705" y="166" text-anchor="middle">36</text>
+                <text class="dg-t-sm" x="705" y="179" text-anchor="middle">R</text>
+                <rect class="dg-box" x="726" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="743" y="166" text-anchor="middle">37</text>
+                <text class="dg-t-sm" x="743" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="764" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="781" y="166" text-anchor="middle">38</text>
+                <text class="dg-t-sm" x="781" y="179" text-anchor="middle">·</text>
+                <rect class="dg-box" x="802" y="150" width="34" height="36" rx="4" />
+                <text class="dg-t-mono" x="819" y="166" text-anchor="middle">39</text>
+                <text class="dg-t-sm" x="819" y="179" text-anchor="middle">·</text>
+                <path class="dg-line-accent" d="M173 100 V114 H380" />
+                <path class="dg-line-accent" d="M194 114 H380" />
+                <text class="dg-t-sm" x="287" y="127" text-anchor="middle">main KV ← 第 2 层</text>
+                <path class="dg-line-accent" d="M401 100 V114 H608" />
+                <path class="dg-line-accent" d="M422 114 H608" />
+                <text class="dg-t-sm" x="515" y="127" text-anchor="middle">main KV ← 第 8 层</text>
+                <path class="dg-line-accent" d="M629 100 V114 H836" />
+                <path class="dg-line-accent" d="M650 114 H836" />
+                <text class="dg-t-sm" x="743" y="127" text-anchor="middle">main KV ← 第 14 层</text>
+                <path class="dg-line-accent" d="M97 186 V200 H836" />
+                <path class="dg-line-accent" d="M118 200 H836" />
+                <text class="dg-t-sm" x="477" y="213" text-anchor="middle">main KV ← 第 20 层</text>
               </svg>
               <figcaption>
-                40 层里只有第 2、8、14、20 这 4 层持有 main KV。规则是：每层去找层号不大于自己的最近一个 source 层，借用它的缓存。
+                40 层里只有 4 层（2 / 8 / 14 / 20）自持 main KV 与 indexer K；8 层产出 Top-K 索引；
+                其余层的 main KV 承自层号更小的最近 source 层：3–7←2、9–13←8、15–19←14、21–39←20。
               </figcaption>
             </figure>
 
+            <h3>四种层角色</h3>
             <div class="table-wrap">
               <table>
-                <thead>
-                  <tr><th>角色</th><th>层号</th><th>自己算什么</th><th>全局 KV 从哪来</th></tr>
-                </thead>
+                <thead><tr><th>角色</th><th>层号（0 基）</th><th>算什么</th><th>借什么</th><th>写不写缓存</th></tr></thead>
                 <tbody>
-                  <tr><td><b>SWA&#8209;only</b></td><td class="num">0, 1</td><td>只算滑窗 KV</td><td>不碰全局 KV</td></tr>
-                  <tr><td><b>Full</b></td><td class="num">2, 8, 14, 20</td><td>Q、滑窗 KV、压缩 main KV、indexer K、Top-K，全部自算并写缓存</td><td>自己生成</td></tr>
-                  <tr><td><b>Reindex</b></td><td class="num">24, 28, 32, 36</td><td>Q、滑窗 KV，并自己再跑一次 indexer 重选 Top-K</td><td>main KV 借第 20 层</td></tr>
-                  <tr><td><b>Reuse</b></td><td>其余 28 层</td><td>只算 Q 和滑窗 KV，然后做注意力</td><td>main KV 和 Top-K 都借别人的，不写任何全局缓存</td></tr>
+                  <tr>
+                    <td><b>SWA&#8209;only</b></td>
+                    <td>0、1</td>
+                    <td>只算 Q 和 128 局部窗口，无全局 KV</td>
+                    <td>不借</td>
+                    <td>不写任何全局缓存</td>
+                  </tr>
+                  <tr>
+                    <td><b>Full</b></td>
+                    <td>2、8、14、20</td>
+                    <td>Q + SWA KV；Compressor 产出 main KV；Indexer 建 Top-K 索引</td>
+                    <td>不借 —— 本层就是 source</td>
+                    <td><b>写</b>：main KV、indexer K、Top-K 索引</td>
+                  </tr>
+                  <tr>
+                    <td><b>Reindex</b></td>
+                    <td>24、28、32、36</td>
+                    <td>Q + SWA KV；<strong>不重压 main KV</strong>，但用自己的 Indexer Q 重选索引</td>
+                    <td>第 20 层的 main KV 和它的候选池</td>
+                    <td>只写 Top-K 索引，不写 KV</td>
+                  </tr>
+                  <tr>
+                    <td><b>Reuse</b></td>
+                    <td>其余 28 层</td>
+                    <td>只算 Q 和 SWA KV，压缩与索引全不算</td>
+                    <td>最近 source 的 main KV + 上一个 source 写好的索引</td>
+                    <td>都不写</td>
+                  </tr>
                 </tbody>
               </table>
             </div>
 
             <h3>按层范围看</h3>
-            <ul>
-              <li><strong>0–1</strong>：纯 SWA。</li>
-              <li><strong>2–19</strong>（encoder 剩下的 18 层）：分 3 组，每组 6 层 = 1 个 Full + 5 个 Reuse。这 3 个 Full 层的压缩比是 2，即每 2 个 token 压成 1 条 main KV。</li>
-              <li><strong>20–23</strong>（decoder 第一组）：1 个 Full + 3 个 Reuse。压缩比 1，不压缩。</li>
-              <li><strong>24–39</strong>：4 组，每组 1 个 Reindex + 3 个 Reuse，全部复用第 20 层的 main KV。</li>
-            </ul>
-
-            <h3>实现口径</h3>
-            <p>对应 config 里三个字段：</p>
-            <pre><code>kv_source_layer_ids    = [2, 8, 14, 20]
-index_source_layer_ids = [2, 8, 14, 20, 24, 28, 32, 36]
-compress_ratios        = [...]   # 43 项，末尾 3 个 0 是 DSpark 的 3 个草稿层占位</code></pre>
-
-            <h3 id="ced">为什么叫 CED</h3>
-            <p>
-              论文说 decoder 的全局 KV 来自 encoder 最后一层的 hidden。看实现：第 20 层是 decoder 唯一的 Full 层，
-              它的输入正好是第 19 层（encoder 最后一层）的输出；第 21–39 层全部复用第 20 层的 KV。
-              所以顺序执行就满足论文定义，<strong>不需要额外的投影分支</strong>。
-            </p>
-            <p>
-              CED 真正的推理价值在 prefill：decoder 只需要 encoder 末层的信息来建全局 KV，
-              所以 prompt 的大部分 token 只要跑前 20 层，decoder 只需要回放最近若干个 token 来补滑窗 KV。
-              这就是「prefill 激活 8B、decode 激活 16B」的来源，也是 <a href="../swa-replay/">SWA Bounded Replay</a> 这个特性存在的前提。
-            </p>
-
-            <div class="callout callout-bad">
-              <span class="callout-label">两个常见误解</span>
-              <p>Reuse 层<strong>不是</strong>推理时的近似。模型训练时就是这个结构，不是推理侧砍掉的。</p>
-              <p>decoder <strong>没有</strong>独立投影把 encoder 输出变成 KV。实现里没有这个分支。</p>
-            </div>
-
-            <div class="callout callout-warn">
-              <span class="callout-label">对推理框架意味着什么</span>
-              KV cache 管理器不能再假设「每层一份同样格式的 KV」。有的层只有滑窗环形缓存，有的层有压缩 KV 加 indexer K，
-              大多数层根本不分配全局 KV。vLLM 里非 source 层的 <code>get_kv_cache_spec</code> 直接返回 <code>None</code>。
-            </div>
-          </section>
-
-          <section class="section" id="csa2">
-            <span class="section-number">04</span>
-            <h2>CSA → CSA2：改了哪四处</h2>
-            <p class="section-note">压长上下文 KV 有三个维度，V4.1 加了第三个。</p>
-
             <div class="table-wrap">
               <table>
-                <thead><tr><th>维度</th><th>手段</th><th>谁做的</th></tr></thead>
+                <thead><tr><th>层范围</th><th>全局注意力</th><th>分组方式</th><th class="num">ratio</th><th>layer type</th></tr></thead>
                 <tbody>
-                  <tr><td>每条多大</td><td>MLA：多头共享一条 512 维 latent</td><td>V4 已有</td></tr>
-                  <tr><td>有多少条</td><td>压缩注意力：m 个 token 压成一条</td><td>V4 已有</td></tr>
-                  <tr><td>多少层各存一份</td><td>跨层共享 main KV 和 indexer K</td><td><b>V4.1 新增</b></td></tr>
+                  <tr><td>Encoder 第 0–1 层</td><td>纯 SWA</td><td>只处理局部窗口（128）</td><td class="num">0</td><td><code>swaonly</code></td></tr>
+                  <tr><td>Encoder 第 2–19 层</td><td>CSA2</td><td>3 组，每组 1 Full + 5 Reuse</td><td class="num">2</td><td><code>c2a</code></td></tr>
+                  <tr><td>Decoder 第 20–23 层</td><td>CSA2</td><td>1 Full + 3 Reuse</td><td class="num">1</td><td><code>c1a</code></td></tr>
+                  <tr><td>Decoder 第 24–39 层</td><td>CSA2</td><td>4 组，每组 1 Reindex + 3 Reuse</td><td class="num">1</td><td><code>c1a</code></td></tr>
                 </tbody>
               </table>
             </div>
 
-            <p>CSA2 在 CSA 基础上改了四处：</p>
-            <ol>
-              <li><strong>压缩时源区间不再重叠。</strong>V4 一条 main KV 由 2m 个彼此重叠的 token 合成；V4.1 只用 m 个不重叠 token。</li>
-              <li><strong>去掉压缩时的绝对位置编码</strong>，改为写缓存前在组起点做一次 RoPE。</li>
-              <li><strong>indexer K 改从 main KV latent 线性投影得到</strong>，不再从 hidden 另开一条压缩路径。</li>
-              <li><strong>加上层维度。</strong>跨层共享 main KV 和 indexer K，并且「共享缓存」和「复用索引」是两件独立的事 —— 这就是 Reindex 这种「借 KV、自己选索引」角色的来源。</li>
-            </ol>
-
             <div class="callout callout-info">
-              <span class="callout-label">一句话</span>
-              CSA 靠压得更狠省显存；CSA2 靠「压得更简单 + 多层复用」同时省显存和算力。
+              <span class="callout-label">实现口径：compress_ratios 为什么有 43 项</span>
+              <p>
+                checkpoint 的 <code>compress_ratios</code> 共 <strong>43 项</strong> = 主干 40 层 + 3 个 DSpark 草稿层占位（尾部 3 个 0）：
+                第 0–1 层 <code>0</code> → 第 2–19 层 <code>2</code>（18 项）→ 第 20–39 层 <code>1</code>（20 项）→ 草稿 3 层 <code>0</code>。
+                <strong>主干只消费前 40 项。</strong>
+              </p>
+              <p>
+                相关字段：<code>kv_source_layer_ids=[2,8,14,20]</code>、
+                <code>index_source_layer_ids=[2,8,14,20,24,28,32,36]</code>、
+                <code>candidate_source_layer_id=20</code>、<code>engram_layer_ids=[1,14]</code>。
+                xLLM 侧见 <code>xllm/python/models/deepseek_v41.py</code> 的 <code>DeepseekV41Config</code> 与 <code>_parse_v41_compress_ratios</code>。
+              </p>
             </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">别说这句话</span>
+              <p><strong>别说</strong>「Reuse 层是推理时的近似」。训练时就是这个结构，不是推理阶段的省算技巧。</p>
+            </div>
+          </section>
+
+          <section class="section wide" id="csa2-evolution">
+            <span class="section-number">04</span>
+            <h2>CSA → CSA2：三个维度同时用上，三处做简</h2>
+            <p class="section-note">
+              长上下文的注意力成本有三个<strong>可相乘</strong>的维度：
+              条目大小、序列长度、层。CSA2 的关键是三个维度同时用上，并把 compressor 与 indexer 都做简。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>维度</th><th>CSA · DeepSeek-V4</th><th>CSA2 · DeepSeek-V4.1</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>压缩</b></td>
+                    <td>压缩率 <code>m</code> 时，每条 main KV 由 <code>2m</code> 条原始 KV 合成，<strong>相邻条目的源区间相互重叠</strong></td>
+                    <td><strong>去掉重叠</strong>：每条 main KV 只由 <code>ratio</code> 个不重叠的源 token 合成，compressor 更简</td>
+                  </tr>
+                  <tr>
+                    <td><b>位置</b></td>
+                    <td>压缩时额外引入绝对位置编码，标记这 <code>2m</code> 条源 token 的位置</td>
+                    <td><strong>去掉绝对位置编码</strong>，压缩 latent 不再显式记位置；改为写缓存前做一次 RoPE 对齐</td>
+                  </tr>
+                  <tr>
+                    <td><b>Indexer K</b></td>
+                    <td>从 hidden states 走<strong>一条独立的压缩路径</strong>产生</td>
+                    <td><strong>由 main KV latent 线性投影 + 归一化</strong>得到（<code>wk</code> 作用在 512 维 latent 上），省掉独立路径</td>
+                  </tr>
+                  <tr>
+                    <td><b>层维</b></td>
+                    <td>基本未覆盖 —— IndexCache / YOIO / HySparse 都只解决单一维度</td>
+                    <td>跨层共享 main KV 与 indexer K，同时允许层间复用 Top-K 索引，<strong>且「缓存共享」与「索引复用」解耦</strong></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <strong>一句话记忆</strong>：CSA 靠「压得更狠」省显存；
+              CSA2 靠「压得统一 + 多设层复用」同时省显存与算力。
+              <code>ratio 1</code> 是 CSA2 的退化特例（不压缩直投）。
+            </p>
           </section>
 
           <section class="section wide" id="dataflow">
             <span class="section-number">05</span>
-            <h2>一层在 decode 时具体做什么</h2>
-            <p class="section-note">两路计算，一个内核。</p>
+            <h2>CSA2 单层数据流：两路 KV 并行汇入同一个内核</h2>
+            <p class="section-note">
+              一层只做两件事：自己算 Q 和最近 128 个 token 的 SWA KV；借来 Full 层压好的 main KV。
+            </p>
 
             <figure>
-              <svg viewBox="0 0 860 300" role="img" aria-label="CSA2 单层数据流：hidden 分局部路和全局路，两路结果送进同一个稀疏注意力内核" class="dg">
-                <rect class="dg-box" x="20" y="126" width="104" height="48" rx="6" />
-                <text class="dg-t" x="72" y="146" text-anchor="middle">hidden</text>
-                <text class="dg-t-sm" x="72" y="162" text-anchor="middle">mHC 折叠后</text>
+              <svg viewBox="0 0 860 352" role="img" aria-label="CSA2 单层数据流：局部路与全局路并行，两路 KV 加 Top-K 索引一起送进同一个稀疏注意力内核" class="dg">
+                <rect class="dg-box" x="250" y="12" width="360" height="40" rx="5" />
+                <text class="dg-t" x="266" y="30">层输入 x（每层）</text>
+                <text class="dg-t-sm" x="266" y="45">[tokens, hc_mult(4), 5120] · mHC 折叠后的 hidden</text>
 
-                <path class="dg-line" d="M124 140 h40 v-70 h30" />
-                <path class="dg-line" d="M124 160 h40 v70 h30" />
+                <path class="dg-line" d="M380 52 V72 H160 V92" />
+                <path class="dg-fill-line" d="M160 98 l-4 -8 h8 z" />
+                <path class="dg-line" d="M480 52 V72 H640 V92" />
+                <path class="dg-fill-line" d="M640 98 l-4 -8 h8 z" />
+                <text class="dg-t-key" x="430" y="66" text-anchor="middle">同一份 x 分两路</text>
 
-                <rect class="dg-box-good" x="194" y="42" width="196" height="58" rx="6" />
-                <text class="dg-t" x="206" y="62">局部路 · 每层都跑</text>
-                <text class="dg-t-sm" x="206" y="80">Q 投影（wq_a → norm → wq_b）</text>
-                <text class="dg-t-sm" x="206" y="94">当前 token 的滑窗 KV → 环形缓存</text>
+                <rect class="dg-box-accent" x="18" y="100" width="284" height="96" rx="5" />
+                <text class="dg-t" x="34" y="120">路 ① 局部路（每层自算）</text>
+                <text class="dg-t-sm" x="34" y="140">Q 投影：wq_a → q_norm → wq_b（MLA 低秩）</text>
+                <text class="dg-t-sm" x="34" y="158">SWA KV：最近 128 个 token 的窗口 KV（block 32）</text>
+                <text class="dg-t-mono" x="34" y="182">→ q, swa_cache</text>
 
-                <rect class="dg-box-accent" x="194" y="202" width="196" height="58" rx="6" />
-                <text class="dg-t" x="206" y="222">全局路 · 只有 Full / Reindex 跑</text>
-                <text class="dg-t-sm" x="206" y="240">Full：Compressor → main KV</text>
-                <text class="dg-t-sm" x="206" y="254">Full / Reindex：Indexer → Top-512</text>
+                <rect class="dg-box-amber" x="558" y="100" width="284" height="96" rx="5" />
+                <text class="dg-t" x="574" y="120">路 ② 全局路（Full / Reindex 层）</text>
+                <text class="dg-t-sm" x="574" y="140">Compressor（仅 Full）：x → main KV latent</text>
+                <text class="dg-t-sm" x="574" y="158">Indexer（Full + Reindex）：打分 → Top-K 索引</text>
+                <text class="dg-t-mono" x="574" y="182">→ compressed_kv, topk_indices</text>
 
-                <path class="dg-line-accent" d="M390 70 h50 v60 h40" />
-                <path class="dg-line-accent" d="M390 230 h50 v-60 h40" />
+                <path class="dg-line-accent" d="M160 196 V216 H430 V236" />
+                <path class="dg-line-accent" d="M700 196 V216 H430" />
+                <path class="dg-fill-accent" d="M430 242 l-5 -9 h10 z" />
 
-                <rect class="dg-box-amber" x="480" y="110" width="150" height="80" rx="6" />
-                <text class="dg-t" x="555" y="136" text-anchor="middle">同一个</text>
-                <text class="dg-t" x="555" y="154" text-anchor="middle">稀疏注意力内核</text>
-                <text class="dg-t-sm" x="555" y="174" text-anchor="middle">+ attention sink</text>
+                <rect class="dg-box-good" x="118" y="248" width="624" height="56" rx="5" />
+                <text class="dg-t" x="134" y="268">稀疏注意力内核 · flash_mla_with_kvcache（每层都跑）</text>
+                <text class="dg-t-sm" x="134" y="286">入参：q · k_cache=swa_cache · extra_k_cache=compressed · topk_indices · attn_sink</text>
+                <text class="dg-t-sm" x="134" y="300">只算被 Top-K 选中的压缩位 + 窗口位（量级：512 + 128）</text>
 
-                <path class="dg-line" d="M630 150 h50" />
-                <path class="dg-fill-line" d="M680 150 l-8 -4 v8 z" />
-
-                <rect class="dg-box" x="686" y="110" width="156" height="80" rx="6" />
-                <text class="dg-t" x="764" y="134" text-anchor="middle">每 query 实际只看</text>
-                <text class="dg-t-key" x="764" y="156" text-anchor="middle">128 + 512 ≈ 640 个位置</text>
-                <text class="dg-t-sm" x="764" y="176" text-anchor="middle">与上下文多长无关</text>
+                <path class="dg-line" d="M430 304 V322" />
+                <path class="dg-fill-line" d="M430 328 l-4 -8 h8 z" />
+                <text class="dg-t-sm" x="446" y="326">输出：逆 RoPE → o_proj（wo_a 分组 8 → wo_b）→ 经 mHC post 写回 4 条残差流</text>
               </svg>
               <figcaption>
-                Q、滑窗 KV、压缩 KV、Top-K 索引、attention sink 是<strong>同一个内核的入参</strong>。
-                内核把窗口的 128 位和选中的 512 个压缩位拼成一条 KV 序列计算。
+                两路 KV 在一个内核里合成一条 KV 序列计算。
+                上游 NVIDIA 线即此内核实现；xLLM 的 NPU 原生实现对应
+                <code>xllm/python/attention/csa2_attention.py</code>。
               </figcaption>
             </figure>
 
             <div class="callout callout-bad">
-              <span class="callout-label">常见误解</span>
-              不要说「先算滑窗注意力，再算全局注意力，然后合并」。两路是同一个内核的入参，不是两次注意力再求和。
+              <span class="callout-label">别说这句话</span>
+              <p>
+                <strong>别说</strong>「先算滑窗注意力，再算全局注意力，再把两个结果合并」。
+                两路 KV 是<strong>同一个内核的两个入参</strong>，不是两次注意力求和。
+              </p>
             </div>
 
-            <h3>两个具体层的走查</h3>
-            <ul>
-              <li><strong>第 2 层（Full）</strong>：Q、滑窗 KV、压缩 KV、indexer K、Top-K 全部自算，全部写缓存。</li>
-              <li><strong>第 25 层（Reuse）</strong>：只算 Q 和滑窗 KV；main KV 读第 20 层的，Top-K 用第 24 层 Reindex 刚选出来的；它不写任何全局缓存。</li>
-            </ul>
+            <h3>跨层共享的三样东西</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>共享对象</th><th>谁写（source）</th><th>谁读（consumer）</th><th>非 source 层本层新增</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>压缩 main KV cache</td>
+                    <td>仅 <code>is_kv_source</code> 层（2/8/14/20）</td>
+                    <td>后续各层，取最近前驱 source 的 cache</td>
+                    <td><b>0</b> —— <code>get_kv_cache_spec</code> 返回 <code>None</code>，不分配</td>
+                  </tr>
+                  <tr>
+                    <td>indexer K cache</td>
+                    <td>仅 <code>owns_k</code>（= kv source）层</td>
+                    <td>非 owner 的 index source 读最近 kv source 的 <code>.indexer.k_cache</code></td>
+                    <td><b>0</b></td>
+                  </tr>
+                  <tr>
+                    <td><code>topk_indices_buffer</code></td>
+                    <td>Full / Reindex 层</td>
+                    <td>Reuse 层沿用上一个 source 写好的索引</td>
+                    <td><b>0</b>（Reuse 不写）</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
 
-            <h3>Compressor 只在 4 个 Full 层跑</h3>
+            <h3>Compressor：main KV 是压出来的（仅 4 个 Full 层跑）</h3>
             <p>
-              压缩比 2 时：每 2 个 token 一组，两路投影分别得到 kv 和门控分数，组内按逐通道 softmax 加权求和，再做 RMSNorm。
-              prefill 分 chunk 时，凑不满一组的尾巴 token 先存进一个小的 state ring，下一个 chunk 再补齐。
-              压缩比 1 时就是每 token 一条，<code>RMSNorm(wkv(x))</code>，没有池化。
+              Compressor 是 CSA2「压」的那一半。只有 4 个 Full 层真的跑它，
+              把本层 attention 输入 <code>x</code> 压成一份共享的 main KV latent（<code>head_dim=512</code>）。
+              走哪条压缩路径由 <code>compress_ratio</code> 决定。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th></th><th><code>ratio = 2</code> · 第 2 / 8 / 14 层</th><th><code>ratio = 1</code> · 第 20 层</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>分组</td>
+                    <td>每 2 个 token 一组、<strong>组间不重叠</strong>，一组压成一条 main KV</td>
+                    <td>无分组，一个 token 一行</td>
+                  </tr>
+                  <tr>
+                    <td>投影</td>
+                    <td>两路：<code>wkv(x)</code> 出 kv、<code>wgate(x)</code> 出打分。<strong>两路都在 fp32 下算</strong>，且 gate 投到完整 512 维（每通道一个门）</td>
+                    <td>仅 <code>wkv</code>，走 bf16</td>
+                  </tr>
+                  <tr>
+                    <td>池化</td>
+                    <td><code>pooled = Σ member_kv · softmax(score)</code>，逐通道独立门控加权。<strong>池化之后才做 RMSNorm</strong></td>
+                    <td>无池化、无门控。<code>latent = RMSNorm(wkv(x))</code>，<strong>RMSNorm 在投影之后</strong></td>
+                  </tr>
+                  <tr>
+                    <td>跨 chunk 状态</td>
+                    <td>prefill 分块时，本块内没凑满一组的尾 token 先停进 state ring（<code>kv_state</code> / <code>score_state</code>），下一块取回补齐。<strong>因为分组不重叠，不需要处理重叠窗口</strong></td>
+                    <td>无 state</td>
+                  </tr>
+                  <tr>
+                    <td>位置</td>
+                    <td>写缓存前在组起点位置 <code>group_idx × ratio</code> 上做 interleaved-pair RoPE</td>
+                    <td>写缓存前在各 token 自身位置做 RoPE（每 token 一份）</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <code>ratio 1</code> 在语义上等价于未压缩的 main KV，只是改由 compressor 统一产出；decoder 第 20–39 层用它。
             </p>
 
             <div class="callout callout-warn">
-              <span class="callout-label">实测踩过的坑</span>
-              Compressor 的跨 chunk 状态和压缩边界对齐，会影响 chunked prefill 与 prefix cache 的实现。
-              图模式下，<strong>每步的稀疏注意力 metadata 必须在回放前刷新</strong>。
-              我们在 xLLM 移植时遇到过：metadata 没刷新，图里用的是 warmup 时的假值，表现为<strong>只在图模式下输出乱码</strong>。
+              <span class="callout-label">一个会咬人的实现细节</span>
+              Compressor 的跨 chunk 状态与压缩边界的对齐会影响 <strong>chunked prefill 和 prefix cache</strong>。
+              另外：<strong>图模式下每步的稀疏注意力 metadata 必须在回放前刷新</strong>。
+              xLLM 移植时漏了这一步，图里一直用 warmup 的 dummy 值，
+              表现为<strong>只在图模式下输出乱码</strong>，并且与投机解码接受率掉到个位数同源。
+            </div>
+
+            <h3>Indexer 打分的实现要点</h3>
+            <p>
+              indexer K 由 main KV latent 经一次线性投影 <code>wk</code> 后再做归一化（<code>k_norm</code>）得到，
+              <strong>不是</strong>从 hidden states 另开路径 —— 这是 CSA2 对 CSA 的核心简化。
+              只有组边界 token（<code>(position+1) % ratio == 0</code>）才发布 K。
+            </p>
+            <p>
+              上游 NVIDIA 线上，<code>weights_proj</code> 是 <code>ReplicatedLinear</code>（无需跨 rank 归约），
+              打分走 DeepGEMM 的 MQA kernel，head-sum 和 ReLU 都在 kernel 内部完成。
+              <strong>所以在那条实现里看不到 Python 侧的 ReLU、门控或 all_reduce</strong> —— 这些逻辑已下沉到 kernel。
+              Q 侧用 <code>fused_indexer_q_rope_quant</code> 一次完成 RoPE + 量化。
+            </p>
+          </section>
+
+          <section class="section wide" id="sparse-index">
+            <span class="section-number">06</span>
+            <h2>两级 Top-K：块级候选池 → 逐位置精选</h2>
+            <p class="section-note">
+              即使大部分层复用索引，剩下的 indexer 仍可能反复扫描百万 token。
+              分层稀疏索引把深层 indexer 的搜索范围从「全部压缩位置」收紧到「候选池上限」。
+            </p>
+
+            <figure>
+              <svg viewBox="0 0 860 196" role="img" aria-label="分层稀疏索引四步：第 20 层全量打分建池，块级候选池取 Top-2048 块，深层 Reindex 在池内选 Top-512，Reuse 层沿用" class="dg">
+                <rect class="dg-box-accent" x="18" y="24" width="190" height="86" rx="5" />
+                <text class="dg-t" x="32" y="44">① 第 20 层（建池层）</text>
+                <text class="dg-t-sm" x="32" y="64">对全部因果可见压缩位置打分</text>
+                <text class="dg-t-sm" x="32" y="82">建候选池，并选本层 Top-512</text>
+                <text class="dg-t-mono" x="32" y="102">candidate_source_layer_id=20</text>
+
+                <path class="dg-line-accent" d="M208 67 h26" /><path class="dg-fill-accent" d="M236 67 l-8 -5 v10 z" />
+
+                <rect class="dg-box-amber" x="240" y="24" width="190" height="86" rx="5" />
+                <text class="dg-t" x="254" y="44">② 块级候选池</text>
+                <text class="dg-t-sm" x="254" y="64">每 8 位置一 block，取块内最高分</text>
+                <text class="dg-t-sm" x="254" y="82">保留 Top-2048 块 → ≤16384 候选</text>
+                <text class="dg-t-sm" x="254" y="102">当前 query 所在未填满块强制钉住</text>
+
+                <path class="dg-line-accent" d="M430 67 h26" /><path class="dg-fill-accent" d="M458 67 l-8 -5 v10 z" />
+
+                <rect class="dg-box-amber" x="462" y="24" width="186" height="86" rx="5" />
+                <text class="dg-t" x="476" y="44">③ 深层 Reindex（24/28/32/36）</text>
+                <text class="dg-t-sm" x="476" y="64">先 apply_candidate_mask 把池外置 -inf</text>
+                <text class="dg-t-sm" x="476" y="82">再各自选 Top-512</text>
+                <text class="dg-t-sm" x="476" y="102">成本由池上限定，与长度解耦</text>
+
+                <path class="dg-line-accent" d="M648 67 h26" /><path class="dg-fill-accent" d="M676 67 l-8 -5 v10 z" />
+
+                <rect class="dg-box" x="680" y="24" width="162" height="86" rx="5" />
+                <text class="dg-t" x="694" y="44">④ Reuse 层</text>
+                <text class="dg-t-sm" x="694" y="64">直接沿用上一个 source</text>
+                <text class="dg-t-sm" x="694" y="82">写入的 Top-512</text>
+                <text class="dg-t-sm" x="694" y="102">不跑 indexer</text>
+
+                <rect class="dg-box-dim" x="18" y="128" width="824" height="58" rx="6" />
+                <text class="dg-t-sm" x="34" y="150">仍随上下文增长的，只剩 4 个 Full 层（2/8/14/20）对完整可见上下文的打分。</text>
+                <text class="dg-t-sm" x="34" y="170">第 24 层起的 Reindex 才被候选池约束 —— 这才是「与上下文长度解耦」的准确含义。</text>
+              </svg>
+              <figcaption>每 query 最终只读 Top-512 压缩位 + 128 窗口位，约 640 个位置。</figcaption>
+            </figure>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>参数</th><th class="num">值</th><th>作用</th></tr></thead>
+                <tbody>
+                  <tr><td><code>index_topk</code></td><td class="num">512</td><td>每 query 最终读取的压缩位置数</td></tr>
+                  <tr><td><code>candidate_topk_blocks</code></td><td class="num">2048</td><td>候选池保留的 block 数</td></tr>
+                  <tr><td><code>candidate_block_size</code></td><td class="num">8</td><td>每 block 的位置数</td></tr>
+                  <tr><td><code>candidate_source_layer_id</code></td><td class="num">20</td><td>建池层</td></tr>
+                  <tr><td><code>index_n_heads</code> / <code>head_dim</code></td><td class="num">32 / 128</td><td>索引侧注意力规模</td></tr>
+                  <tr><td><code>indexer_kv_dtype</code></td><td class="num">auto → fp8</td><td>索引 K 缓存精度（上游可选 MXFP4，需特定硬件）；<strong>昇腾侧恒 INT8</strong></td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>算例：1M 上下文、单 token decode</h3>
+            <p>
+              第 20 层（建池层，<code>ratio 1</code> 不压缩）对全部约 1,048,576 个位置打分，
+              选出 2048 块 × 8 位 = <strong>16384 个候选位</strong>。
+              深层 Reindex 的打分范围从「全部压缩位」收敛到「池内 ≤16384 位」，
+              每个 query 最终只读 Top-512 压缩位 + 128 窗口位。
+              encoder 的 3 个 Full 层（2/8/14，<code>ratio 2</code>）各对约 52 万个压缩位打分。
+            </p>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">别说这句话</span>
+              <p>
+                <strong>别说</strong>「所有 indexer 都与上下文长度无关」。
+                4 个 Full 层的打分仍与长度线性相关，这是总计算中仍随长度增长的部分。
+              </p>
             </div>
           </section>
 
-          <section class="section" id="index">
-            <span class="section-number">06</span>
-            <h2>分层稀疏索引</h2>
-            <p class="section-note">解决的问题：即使大部分层复用索引，Full 和 Reindex 层的 indexer 仍要对全部压缩位置打分。</p>
+          <section class="section wide" id="mhc">
+            <span class="section-number">07</span>
+            <h2>mHC 与 Single-Pass「错位一拍」</h2>
 
-            <ol class="steps">
+            <h3>mHC 是什么：4 条残差流 + 折叠 / 展开</h3>
+            <p>
+              mHC（Manifold-Constrained Hyper-Connections，流形约束超连接）把残差流维护成
+              <code>hc_mult = 4</code> 条并行拷贝，形状 <code>(tokens, 4, 5120)</code>。
+              Attention 与 MoE 各自夹在 <code>hc_pre</code>（4→1 折叠）与 <code>hc_post</code>（1→4 展开并混合）之间：
+              先折叠成 1 条喂给子层，算完再展开回 4 条混回残差。
+              混合系数经 <strong>Sinkhorn 双随机化</strong>（迭代把矩阵调到每行每列和都为 1）。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>步骤</th><th>子块 1 · Attention</th><th>子块 2 · MoE</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>A · hc_pre（4→1）</b></td>
+                    <td><code>pre_mix = sigmoid(logits) + eps</code> 加权求和；<strong>用上一拍传入的 pre_mix</strong></td>
+                    <td><strong>错位一拍</strong>：直接用子块 1 的 <code>pre_mix</code> 折叠，无需等本拍系数算完</td>
+                  </tr>
+                  <tr>
+                    <td><b>F · 子层</b></td>
+                    <td><code>attn_norm</code> → CSA2 两路 KV 稀疏注意力</td>
+                    <td>1 共享 + 384 路由（top-6）；<code>sqrtsoftplus</code> 激活、<code>noaux_tc</code> 偏置校正</td>
+                  </tr>
+                  <tr>
+                    <td><b>B/C · hc_post（1→4）</b></td>
+                    <td><code>out = post·x + Σ comb·residual</code>，<code>comb</code> 经 Sinkhorn 双随机化</td>
+                    <td>返回 <code>ffn_pre</code> 交给下一层</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              Engram 注入发生在<strong>子块 2 之前、完整 4 条流上</strong>，这样混合系数能看到被注入后的残差流。
+            </p>
+
+            <h3>Single-Pass = 把 post 融进下一层的 pre</h3>
+            <p>
+              代码注释直言：<em>Every layer's post runs inside the next layer's fused pre</em>。
+              落到实现就是 —— FFN 子块的 <code>hc_pre</code> 直接复用 Attention 子块已算出的 <code>pre_mix</code>，
+              由 <code>mhc_shifted_post_pre</code> 一次完成 post + 下一步 pre。
+            </p>
+            <p>
+              <strong>收益来自消除等待</strong>：系数错位一拍后，kernel 遍历每个 tile 时可以同时完成输入混合
+              并累积下一步的系数统计量，不必等本拍系数算完 —— 这就是 Single-Pass 相对 multi-pass 的收益。
+            </p>
+
+            <h3>部署融合 = Mega-mHC</h3>
+            <p>
+              部署期再把 residual update、input mixing、coefficient prediction 融成单个 kernel。
+              上游有门控条件（特定硬件 + <code>hidden_size % 1024 == 0</code> + <code>hc_mult == 4</code> + DeepGEMM 支持），
+              不满足就回退到多 kernel 路径。
+              论文口径：激活访存从 <code>(4n+4)d</code> 降到 <code>(2n+2)d</code>。
+              xLLM 侧对应 <code>mhc_shifted_post_pre_*</code>。
+            </p>
+          </section>
+
+          <section class="section wide" id="engram">
+            <span class="section-number">08</span>
+            <h2>Engram：把「记忆」从计算里拆出来</h2>
+            <p class="section-note">
+              Engram 是一个条件记忆模块：把「记住静态知识」从层计算里拆出来，改由稀疏查表完成。
+              全模型 196B 参数放在表里，但每个 token 只稀疏访问其中极少一部分，几乎不增加每 token 算力。
+            </p>
+
+            <ul class="steps">
               <li>
-                <h4>第 20 层建池</h4>
+                <h4>① 取 n-gram</h4>
+                <p>对文本 token 取 2 / 3 / 4 阶 n-gram；<strong>图像 token 不参与</strong>。</p>
+              </li>
+              <li>
+                <h4>② 压缩词表 + 多头哈希</h4>
                 <p>
-                  对全部可见位置打分，选出本层 Top-512；同时建一个<strong>候选池</strong>：每 8 个位置一个块，
-                  取块内最高分，保留 Top-2048 块，最多 16384 个候选位置。
+                  NFKC→NFD→去重音→小写→空白折叠得到压缩词表（约 99092 项，字段 <code>engram_compressed_vocab_size</code>）；
+                  每个 head 把 n-gram 哈希进自己的桶。
                 </p>
               </li>
               <li>
-                <h4>Reindex 层只在池内选</h4>
-                <p>第 24/28/32/36 层先把池外位置的分数置为负无穷，只在池内选 Top-512。</p>
+                <h4>③ 素数桶查表</h4>
+                <p>
+                  {2,3,4} 阶 × 8 头，每头一张约 16M 项的表，<strong>表长取互不相同的素数</strong>。命中一条 FP8 表示。
+                </p>
               </li>
               <li>
-                <h4>Reuse 层不跑 indexer</h4>
-                <p>直接用上一个 Reindex 层选出的 Top-K。</p>
+                <h4>④ 投影成 key / value</h4>
+                <p>命中的表示经投影得到 memory key / value，key 对齐到 <code>hc_mult</code> 条残差流。</p>
               </li>
-            </ol>
+              <li>
+                <h4>⑤ 门控注入</h4>
+                <p><code>x' = x + gate · value</code>，<code>gate</code> 由「memory key 与当前残差流的匹配度」经 sigmoid 得到。</p>
+              </li>
+            </ul>
 
-            <h3>用 1M 上下文、单 token decode 算一下</h3>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>层</th><th class="num">打分的位置数</th><th>随上下文增长？</th></tr></thead>
+                <thead><tr><th></th><th>论文口径</th><th>实现口径</th></tr></thead>
                 <tbody>
-                  <tr><td>第 20 层（Full，ratio 1）</td><td class="num">≈ 1,000,000</td><td>是</td></tr>
-                  <tr><td>第 2 / 8 / 14 层（Full，ratio 2）</td><td class="num">各 ≈ 520,000</td><td>是</td></tr>
-                  <tr><td>第 24 / 28 / 32 / 36 层（Reindex）</td><td class="num">各 ≤ 16,384</td><td><b>否</b></td></tr>
-                  <tr><td>其余 28 层（Reuse）</td><td class="num">0</td><td>否</td></tr>
+                  <tr>
+                    <td>规模与放置</td>
+                    <td>196B 参数<strong>近似</strong>对半放在 2 个模块（表长取不同素数，故非严格均分：<code>engram_num_embeddings=[384006168, 384016682]</code>）；每模块 {2,3,4} 阶、8 个哈希头、每阶总嵌入维 2048；嵌入表与 key/value 投影都用 FP8</td>
+                    <td>放在第 1、14 层（<code>engram_layer_ids=[1,14]</code>），以平衡流水线各级显存</td>
+                  </tr>
+                  <tr>
+                    <td>相对原始 Engram 的改动</td>
+                    <td>① 去掉短因果卷积；② 嵌入表更新改用动量 + Sinkhorn 平衡</td>
+                    <td>代码侧不可核</td>
+                  </tr>
+                  <tr>
+                    <td>offload 与预取</td>
+                    <td>—</td>
+                    <td>表可放 host 内存；确定性寻址使表项可预取，首个模块的预取与第 1 个 block 的计算重叠，消费前 join；查表结果反量化到 bf16。每请求保留最近 <code>max_ngram_size−1</code> 个 token 供图回放时补历史；表按 TP×DP 分片</td>
+                  </tr>
                 </tbody>
               </table>
             </div>
+
             <p>
-              所以<strong>仍然随上下文增长的，只剩 4 个 Full 层的打分</strong>。这就是「与上下文长度解耦」的具体含义。
-              indexer 参数：32 头、head_dim 128、Top-K 512。
+              xLLM 侧的主机侧卸载实现（含 DP 共享内存、融合 CPU 查表算子、以及它的代价）
+              单独一页：<a href="../engram-offload/">Engram 主机侧卸载</a>。
             </p>
+          </section>
+
+          <section class="section wide" id="vision">
+            <span class="section-number">09</span>
+            <h2>DeepSeek-ViT + Aligner</h2>
+
+            <div class="summary">
+              <div>
+                <dt>视觉编码器</dt>
+                <dd>
+                  32 层、隐藏 1024、16 头、中间维 2816、patch 14，2D-RoPE，RMSNorm + SwiGLU。
+                  图像经 <code>3×3</code> pixel-unshuffle（<code>downsample_ratio=3</code>）把空间特征重排到通道维，
+                  视觉 token 降为 <strong>1/9</strong>，再由 Aligner（MLP）映射到主干维度。
+                </dd>
+              </div>
+              <div>
+                <dt>规模限制</dt>
+                <dd>
+                  <code>max_image_tokens=1024</code>、<code>min_pixels=295936</code>（= 544²）；
+                  起止与换行用可学习嵌入 <code>image_start</code> / <code>image_end</code> / <code>image_newline</code>。
+                </dd>
+              </div>
+              <div>
+                <dt>模态相关路由</dt>
+                <dd>
+                  图像 token 走独立的专家 correction bias（<code>gate.bias_vl</code>），与文本的
+                  <code>e_score_correction_bias</code> 分开。
+                  <strong>偏置只用于专家选择，输出加权仍用原始路由分数。</strong>
+                </dd>
+              </div>
+              <div>
+                <dt>一个硬约束</dt>
+                <dd>图像 span 必须在 <code>start_pos=0</code> 的单次 chunk 内 prefill。</dd>
+              </div>
+            </div>
+          </section>
+
+          <section class="section wide" id="kvcache">
+            <span class="section-number">10</span>
+            <h2>KV 缓存：归属与相对大小</h2>
+            <p class="section-note">
+              这一节不逐字节去数记录，而看<strong>谁持有、持有多少条、复用谁的</strong>。
+              记录的具体格式随平台与 dtype 路径而异。
+            </p>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>缓存族</th><th>谁持有</th><th>条数与请求长度 T 的关系</th><th>复用关系</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>SWA KV</b></td>
+                    <td>每层自持</td>
+                    <td><strong>恒定窗口 128，与 T 无关</strong></td>
+                    <td>每层自算，不跨层复用</td>
+                  </tr>
+                  <tr>
+                    <td><b>压缩 main KV</b></td>
+                    <td>仅 4 个 kv-source 层（2/8/14/20）</td>
+                    <td><code>T ÷ ratio</code> 条（按 latent 计）</td>
+                    <td>非 source 层复用更早的 source，<strong>本层 0 新增</strong>（<code>get_kv_cache_spec</code> 返回 <code>None</code> 不分配）</td>
+                  </tr>
+                  <tr>
+                    <td><b>indexer K</b></td>
+                    <td>仅 kv-source 层 <code>owns_k</code></td>
+                    <td><code>T ÷ ratio</code> 条（维度更小）</td>
+                    <td>非 owner 复用更早 source 的 <code>.indexer.k_cache</code>，本层 0 新增</td>
+                  </tr>
+                  <tr>
+                    <td><b>草稿层 SWA</b></td>
+                    <td>DSpark 3 个草稿层各自持</td>
+                    <td>恒定窗口（同 128）</td>
+                    <td>草稿层独立，<strong>不并入主干复用链</strong></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>890 B/token 是怎么来的（论文口径）</h3>
+            <p>
+              论文给出「全局 KV 压到 890 B/token，约 V4-Flash 的 1/4；持久化缓存约 1/8」。
+              按技术报告的参数可以推出这个数，与官方数字吻合：
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>项</th><th>构成</th><th class="num">字节</th></tr></thead>
+                <tbody>
+                  <tr><td>main KV 一条</td><td>512 维 × 0.5 B（E2M1）+ 512/16 个 E4M3 scale</td><td class="num">288 B</td></tr>
+                  <tr><td>indexer K 一条</td><td>128 维 MXFP4 = 64 B + 4 B scale</td><td class="num">68 B</td></tr>
+                  <tr><td>encoder 3 个 ratio-2 层</td><td><code>3 × (288+68) ÷ 2</code></td><td class="num">534 B</td></tr>
+                  <tr><td>decoder 第 20 层（ratio 1）</td><td><code>288 + 68</code></td><td class="num">356 B</td></tr>
+                  <tr><td><b>合计</b></td><td>只有 4 个 Full 层持有</td><td class="num"><b>890 B/token</b></td></tr>
+                </tbody>
+              </table>
+            </div>
 
             <div class="callout callout-bad">
-              <span class="callout-label">常见误解</span>
-              不要说「所有 indexer 都与长度无关」。4 个 Full 层的打分仍然与长度线性相关。
+              <span class="callout-label">890 B/token 不能直接用于昇腾上的容量规划</span>
+              <p>
+                这个口径<strong>不含每层 128 窗口的 SWA KV</strong>（固定大小、与上下文长度无关）。
+                更重要的是：<strong>实现层的 packed record 字节数与此不同</strong>。
+                例如昇腾侧 indexer K 恒为 INT8，而不是论文口径的 MXFP4。
+              </p>
+              <p>
+                做 A3 / A5 的 KV 容量规划时，请按目标平台实际的缓存格式重新算，
+                或直接读启动日志里引擎报出的 KV block 数与单 block 字节数。
+                <strong>本页不给昇腾侧的绝对字节数</strong>：那需要按具体版本核对缓存布局，我们没有在当前版本上核过。
+              </p>
             </div>
-          </section>
-
-          <section class="section" id="mhc">
-            <span class="section-number">07</span>
-            <h2>mHC 与 Single-Pass mHC</h2>
-            <p class="section-note">mHC 是 V4 就有的残差流设计，V4.1 改了系数的时序。</p>
-
-            <p>
-              mHC 把残差流从 1 条扩成 4 条并行副本，形状是 <code>tokens × 4 × 5120</code>。
-              每个子层前先用 <code>hc_pre</code> 把 4 条加权折叠成 1 条喂进去，算完用 <code>hc_post</code> 展开回 4 条，
-              并按一个 4×4 混合矩阵把旧残差混进来。这个矩阵用 Sinkhorn 迭代 20 次，使每行每列之和为 1。
-            </p>
-            <p>
-              V4.1 的改动叫 <strong>Single-Pass mHC</strong>：每个子块算出的折叠系数，留给<strong>下一个</strong>子块使用。
-              注意力子块用的是上一层 FFN 子块算出的系数，FFN 子块用的是本层注意力子块算出的系数。
-              好处是折叠输入时不用等本子块的系数算完，可以把「上一子块的输出混合」和「下一子块的输入折叠」融成一个 kernel。
-              论文说部署时融成单个 Mega-mHC kernel 后，激活访存从 <code>(4n+4)d</code> 降到 <code>(2n+2)d</code>。
-            </p>
-
-            <div class="callout callout-warn">
-              <span class="callout-label">对推理的影响</span>
-              残差流的激活是普通模型的 4 倍；<code>hc_pre</code> / <code>hc_post</code> 都是小算子，不融合就会成为 host 下发开销。
-              昇腾上对应 xLLM 的 <code>mhc_shifted_post_pre_*</code> 融合算子。
-            </div>
-          </section>
-
-          <section class="section" id="engram">
-            <span class="section-number">08</span>
-            <h2>Engram：把静态知识改成查表</h2>
-            <p class="section-note">这里只讲模型侧；部署侧的显存卸载见 <a href="../engram-offload/">Engram 卸载</a>。</p>
-
-            <ol class="steps">
-              <li><h4>取 n-gram</h4><p>对文本 token 取 2、3、4 阶 n-gram。图像 token 不参与。</p></li>
-              <li><h4>规范化</h4><p>先把 token 规范化成一个压缩词表（大小写、重音等折叠后约 9.9 万）。</p></li>
-              <li><h4>哈希</h4><p>用 8 个哈希头把 n-gram 映射进各自的表。</p></li>
-              <li><h4>投影出 key / value</h4><p>命中的表项经投影得到 key 和 value。</p></li>
-              <li><h4>门控加回残差流</h4><p>用 key 与当前残差流的匹配度算一个 sigmoid 门控，再把 value 加回残差流。</p></li>
-            </ol>
-
-            <p><strong>规模</strong>：196B 参数，分 2 个模块，放在第 1 层和第 14 层。表项是 FP8。</p>
 
             <div class="callout callout-info">
-              <span class="callout-label">为什么能卸载到 host</span>
-              查哪些表项<strong>只取决于输入 token</strong>，可以在进层前就算出来。所以表放 host 内存，提前预取，和第 1 层计算重叠。
-            </div>
-
-            <div class="callout callout-warn">
-              <span class="callout-label">decode 时的一个细节</span>
-              n-gram 需要前几个 token 的历史，图模式回放时要每请求保留最近 3 个 token 来补齐。
+              <span class="callout-label">一个容易漏的参数</span>
+              <code>compress_rope_theta = 160000</code>，比 <code>rope_theta = 10000</code> 大得多。
+              原因：一条压缩 latent 代表 <code>ratio</code> 个 token，位置更稀疏，所以要配更大的 theta。
+              xLLM 侧 <code>ratio &gt; 0</code> 的层用压缩 RoPE 表（theta 160000 + YaRN），
+              <code>ratio 0</code> 的层用普通表（theta 10000、YaRN 关）。
             </div>
           </section>
 
-          <section class="section" id="vision">
-            <span class="section-number">09</span>
-            <h2>视觉部分</h2>
-            <p>
-              标准做法：32 层 ViT，patch 14，2D-RoPE；3×3 pixel-unshuffle 把 token 数降到九分之一，2 层 MLP 映射到主干维度。
-            </p>
-            <p>
-              两个推理相关的细节：图像 token 在 MoE 里用<strong>独立的路由偏置</strong>；
-              图像片段<strong>必须在一次 prefill chunk 内处理完</strong>，不能被 chunk 切开。
-            </p>
-          </section>
-
-          <section class="section wide" id="kv">
-            <span class="section-number">10</span>
-            <h2>KV 缓存族：谁持有、持有多少条</h2>
-            <p class="section-note">容量规划最常问的一节。设一个请求总长 T。</p>
-
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>缓存</th><th>哪些层持有</th><th class="num">条数</th><th>随 T 增长？</th></tr></thead>
-                <tbody>
-                  <tr><td><b>SWA KV</b></td><td>每层自持</td><td class="num">固定 128</td><td>否</td></tr>
-                  <tr><td><b>main KV</b></td><td>只有 4 个 Full 层</td><td class="num">ratio 2 的层 T/2；第 20 层 T</td><td>是</td></tr>
-                  <tr><td><b>indexer K</b></td><td>同样这 4 层</td><td class="num">同 main KV，维度更小（128）</td><td>是</td></tr>
-                  <tr><td><b>DSpark 草稿层</b></td><td>3 个草稿层各一份 SWA</td><td class="num">固定窗口</td><td>否</td></tr>
-                </tbody>
-              </table>
-            </div>
-
-            <h3>论文的 890 字节 / token 是怎么算的</h3>
-            <pre><code>main KV  一条 = 512 维 × FP4(0.5B) + 32 个 FP8 scale = 288 B
-indexer K 一条 = 128 维 FP4 + 4 B scale             =  68 B
-                                          每条合计   = 356 B
-
-encoder 3 个 Full 层（ratio 2）: 3 × 356 ÷ 2 = 534 B
-第 20 层（不压缩）            :     356      = 356 B
-                                 合计        = 890 B / token</code></pre>
-            <p>注意这个数<strong>不含滑窗 KV</strong>，滑窗是固定开销。</p>
-
-            <h3>昇腾上实际是多少</h3>
-            <div class="callout callout-warn">
-              <span class="callout-label">验证强度：未实测</span>
-              下表按 vllm-ascend 快照 <code>cache_config.py</code> 的缓存格式<strong>推算</strong>，没有在机器上实测过字节数。
-              FP4 KV 需要硬件支持，不同代昇腾的缓存格式不同。
-            </div>
-
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>缓存</th><th>A2 / A3</th><th>A5</th></tr></thead>
-                <tbody>
-                  <tr><td>main KV</td><td>BF16，512 维 = 1024 B/条</td><td>FP4 打包 + 每 16 维一个 BF16 scale = 320 B/条</td></tr>
-                  <tr><td>indexer K</td><td>INT8 + 每条一个 FP16 scale = 130 B/条</td><td>FP4 + 每 32 维一个 UE8M0 scale = 68 B/条</td></tr>
-                  <tr><td>SWA KV</td><td>由运行配置决定（未核）</td><td>MXFP8 + 每 32 维一个 BF16 scale = 544 B/条</td></tr>
-                  <tr><td><b>全局 KV / token</b><br /><em>按论文同样方法推算</em></td><td><b>≈ 2.9 KB</b><br /><em>未计 main KV 的 scale</em></td><td><b>≈ 970 B</b></td></tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div class="callout callout-bad">
-              <span class="callout-label">不要这样用</span>
-              不要把论文的 890 B/token 直接用于 A3 的容量规划。A3 上全局 KV 大约是论文数字的 3 倍多；A5 才接近 890。
-            </div>
-          </section>
-
-          <section class="section" id="quant">
+          <section class="section wide" id="quant">
             <span class="section-number">11</span>
-            <h2>量化</h2>
+            <h2>量化：五种格式按敏感度分配</h2>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>对象</th><th>格式</th><th>细节</th></tr></thead>
+                <tbody>
+                  <tr><td>线性权重</td><td>FP8</td><td>默认 block <code>[128,128]</code> e4m3 动态 + UE8M0 scale；原生 MXFP8 checkpoint（<code>weight_block_size=[32,32]</code> + <code>is_scale_e8m0</code>）走 MXFP8 路径</td></tr>
+                  <tr><td>MoE 专家</td><td>MXFP4</td><td><code>expert_dtype</code> 默认 <code>"fp4"</code> → MXFP4（每 32 维一块）+ UE8M0；<code>"NVFP4"</code> 时走 group 16；<code>"fp8"</code> 时走 block fp8</td></tr>
+                  <tr><td>压缩 main KV</td><td>NVFP4</td><td>E2M1 + 每 16 维一个 E4M3 scale</td></tr>
+                  <tr><td>Indexer K</td><td>MXFP4 / FP8</td><td>MXFP4：E2M1 + 每 32 维 UE8M0；FP8：per-token scale。<strong>昇腾侧恒 INT8 + FP16 scale</strong></td></tr>
+                  <tr><td>SWA KV</td><td>FP8</td><td>包装成 <code>fp8_ds_mla</code> 记录；整条 post-RoPE 向量量化</td></tr>
+                  <tr><td>Engram 表</td><td>FP8</td><td>e4m3 行 + uint8 UE8M0 block(32)；查表时按块 scale 反量化到 bf16</td></tr>
+                </tbody>
+              </table>
+            </div>
+
             <p>
-              官方权重：线性层 FP8，MoE 专家 FP4，Engram 表 FP8；main KV 是 FP4，训练时做了量化感知训练（QAT）；滑窗 KV 是 FP8。
-            </p>
-            <p>
-              官方表里的硬件门控（SM100 等）是 NVIDIA 线的，昇腾上按<a href="#kv">上一节</a>那张表走。昇腾上另有 W8A8 权重路线。
+              <strong>硬件分档</strong>：上游的 MXFP8 / NVFP4 记录与 MXFP4 indexer 都有硬件门控，
+              不满足就回退到 FP8 路径。昇腾侧走自己的格式（见上表最后一列），不受这些门控影响。
             </p>
           </section>
 
           <section class="section wide" id="v4-diff">
             <span class="section-number">12</span>
-            <h2>V4 → V4.1 改了什么</h2>
-            <p class="section-note">V4.1 不是放大版，而是沿「长上下文的显存与算力」做了一组替换。</p>
+            <h2>DeepSeek-V4-Flash → V4.1-Flash：改了什么</h2>
+            <p class="section-note">
+              V4.1-Flash 不是把 V4 放大，而是沿「长上下文的显存与算力」这条主轴做了一组<strong>结构替换</strong>。
+            </p>
 
             <div class="table-wrap">
               <table>
-                <thead><tr><th>维度</th><th>V4-Flash</th><th>V4.1-Flash</th><th>目标</th></tr></thead>
+                <thead><tr><th>组件</th><th>V4-Flash</th><th>V4.1-Flash</th><th>效果（论文口径）</th></tr></thead>
                 <tbody>
-                  <tr><td>主干组织</td><td>普通层栈</td><td>CED</td><td>prefill 只跑一半层</td></tr>
-                  <tr><td>注意力</td><td>CSA / HCA</td><td>CSA2 + 跨层复用 + 分层索引</td><td>砍 decode 显存与索引计算</td></tr>
-                  <tr><td>持久化 KV</td><td>滑窗 KV 持久化到 SSD</td><td>SWA Bounded Replay：需要时回放最近 128 个 token 重建</td><td>官方说约为 V4-Flash 的 1/8</td></tr>
-                  <tr><td>残差</td><td>mHC</td><td>Single-Pass mHC</td><td>可融成单 kernel</td></tr>
-                  <tr><td>静态知识</td><td>—</td><td>新增 Engram（196B 查表）</td><td>知识从层计算里拆出来</td></tr>
-                  <tr><td>main KV 精度</td><td>FP8</td><td>FP4（QAT）</td><td>砍 main KV 字节</td></tr>
-                  <tr><td>推测解码</td><td>预训练带 1 层 MTP，上线约两周后换成 DSpark</td><td>预训练不带 MTP，DSpark 在预训练后单独训练</td><td>—</td></tr>
+                  <tr>
+                    <td><b>主干组织</b></td>
+                    <td>—</td>
+                    <td>CED：前 20 层 causal encoder，decoder 全局 KV 由其末层产出</td>
+                    <td>prefill 时 prompt 主体只需过 encoder 20 层，prefill 计算 ≈ 减半</td>
+                  </tr>
+                  <tr>
+                    <td><b>注意力</b></td>
+                    <td>CSA / HCA</td>
+                    <td>CSA2：去重叠压缩 + 去绝对位置编码 + indexer K 投影自 main KV</td>
+                    <td>实现更简、训练更高效</td>
+                  </tr>
+                  <tr>
+                    <td><b>跨层复用</b></td>
+                    <td>无层维复用</td>
+                    <td>Full / Reindex / Reuse 三模式 + 分层稀疏索引</td>
+                    <td>全局 KV ≈ <b>1/4</b> vs V4-Flash</td>
+                  </tr>
+                  <tr>
+                    <td><b>SWA 缓存</b></td>
+                    <td>在「持久化 SWA KV」与「回放重建」之间混合取舍</td>
+                    <td>SWA Bounded Replay（encoder 侧 + decoder 侧）</td>
+                    <td>持久 KV ≈ <b>1/8</b> vs V4-Flash</td>
+                  </tr>
+                  <tr>
+                    <td><b>残差</b></td>
+                    <td>mHC（multi-pass，三 kernel）</td>
+                    <td>Single-Pass mHC + Mega-mHC 融合 kernel</td>
+                    <td>激活访存减半</td>
+                  </tr>
+                  <tr>
+                    <td><b>条件记忆</b></td>
+                    <td>无</td>
+                    <td>Engram 196B：n-gram 查表 + 门控注入</td>
+                    <td>以查表替代部分计算</td>
+                  </tr>
+                  <tr>
+                    <td><b>投机解码</b></td>
+                    <td>MTP（深度 1）</td>
+                    <td>DSpark：3 层草稿，5 位置并行 + Markov / Confidence 头</td>
+                    <td>解码吞吐提升（<a href="../dspark/">详见 DSpark 页</a>）</td>
+                  </tr>
+                  <tr>
+                    <td><b>主 KV 精度</b></td>
+                    <td>FP8 main KV</td>
+                    <td>FP4 main KV：E2M1 + 每 16 通道 1 个 E4M3 scale，QAT 训练；<strong>SWA KV 仍 FP8</strong></td>
+                    <td>主 KV 存储 ≈ 减半</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>
+              <strong>读法</strong>：这条演进线目标一致 —— 尽量把「随上下文长度增长的成本」挪到「与长度无关的常数」上。
+              CED 砍 prefill、CSA2 + 分层索引砍 decode 的索引与显存、SWA Bounded Replay 砍持久缓存、FP4 砍主 KV 字节。
+            </p>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">SWA Bounded Replay 的上游落地状态要分两侧看</span>
+              encoder 侧已合入上游 vLLM；<strong>decoder 侧（CED「prefill 减半」的前提）尚未合入</strong>。
+              xLLM 有自己的实现，但<strong>是显式有损的</strong>，差别在哪、为什么有损，见
+              <a href="../swa-replay/">SWA Bounded Replay</a> 那一页。
+            </div>
+          </section>
+
+          <section class="section wide" id="glossary">
+            <span class="section-number">13</span>
+            <h2>术语表与代码线</h2>
+
+            <h3>术语表</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>缩写</th><th>全称</th><th>一句话</th></tr></thead>
+                <tbody>
+                  <tr><td>CED</td><td>Causal Encoder-Decoder</td><td>论文口径把 40 层切成「前 20 层编码 + 后 20 层解码」，解码侧全局 KV 来自编码末层</td></tr>
+                  <tr><td>DSA</td><td>DeepSeek Sparse Attention</td><td>DeepSeek 家族稀疏注意力的统称（先选位置再算注意力），CSA2 是其演进</td></tr>
+                  <tr><td>CSA / CSA2</td><td>Compressed Sparse Attention</td><td>把序列压成更少的 latent 条目再做稀疏选择；CSA2 是 V4.1 的版本</td></tr>
+                  <tr><td>HCA</td><td>Heavily Compressed Attention</td><td>重度压缩注意力（V4 与 CSA 混用）；V4.1 已改为纯 CSA2</td></tr>
+                  <tr><td>MLA</td><td>Multi-head Latent Attention</td><td>多头共享一份压缩 latent 的注意力；K/V 由低秩上投影得到</td></tr>
+                  <tr><td>SWA</td><td>Sliding Window Attention</td><td>只看最近固定窗口（本模型 128）的注意力</td></tr>
+                  <tr><td>Full</td><td>满配层</td><td>本层自己压 main KV、自己建 Top-K 索引，供后面层复用</td></tr>
+                  <tr><td>Reindex</td><td>重选索引层</td><td>main KV 借别人的，但本层重新选一遍 Top-K 索引</td></tr>
+                  <tr><td>Reuse</td><td>全复用层</td><td>main KV 和索引都借前面的，本层只跑注意力</td></tr>
+                  <tr><td>latent</td><td>潜在向量（压缩表示）</td><td>多头 K/V 压成的一条共享低秩向量；main KV 按它计条数</td></tr>
+                  <tr><td>mHC</td><td>Manifold-Constrained Hyper-Connections</td><td>把残差流做成 4 条并行拷贝，层内折叠成 1 条、算完再展开混回</td></tr>
+                  <tr><td>Engram</td><td>条件记忆（n-gram 查表）</td><td>把静态知识放进大表里查，而不是靠算力硬算</td></tr>
+                  <tr><td>DSpark</td><td>投机解码草稿模型</td><td>用小草稿模型一次多猜几个 token，再交主模型批量验证</td></tr>
+                  <tr><td>MoE</td><td>Mixture-of-Experts</td><td>多个专家子网络按 token 路由激活，只跑其中一部分</td></tr>
+                  <tr><td>Sinkhorn</td><td>Sinkhorn 双随机化</td><td>迭代把矩阵调到「每行每列和都为 1」</td></tr>
+                  <tr><td>sqrtsoftplus</td><td>平方根 Softplus</td><td>Softplus 激活再开平方的变体，MoE 路由打分用</td></tr>
+                  <tr><td>noaux_tc</td><td>无辅助损失的 Top-K 校正</td><td>不用辅助损失，改用偏置项校正专家选择</td></tr>
+                  <tr><td>E4M3 / E2M1</td><td>FP8 / FP4 的元素格式</td><td>分别是「4 位指数 + 3 位尾数」和「2 位指数 + 1 位尾数」</td></tr>
+                  <tr><td>UE8M0</td><td>8 位纯指数 scale</td><td>只存指数、不存尾数的缩放因子格式</td></tr>
+                  <tr><td>MXFP4 / MXFP8</td><td>微缩放格式（每 32 维一块）</td><td>每 32 维共享一个 scale</td></tr>
+                  <tr><td>NVFP4</td><td>NVIDIA 微缩放 FP4（每 16 维一块）</td><td>每 16 维共享一个 E4M3 scale</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>三条实现代码线</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>线</th><th>定位</th><th>关键文件</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><b>上游 vLLM</b></td>
+                    <td>论文结构的 NVIDIA 参考实现</td>
+                    <td><code>vllm/models/deepseek_v41/</code>（<code>attention.py</code> 稀疏 MLA 后端、<code>compressor.py</code>、<code>common/engram.py</code>、<code>common/mm_preprocess.py</code>）</td>
+                  </tr>
+                  <tr>
+                    <td><b>vllm-ascend</b></td>
+                    <td>把 V4.1 结构适配到昇腾 NPU 的移植线</td>
+                    <td><code>vllm_ascend/models/deepseek_v41/indexer.py</code>（indexer K = INT8 + FP16 scale）、<code>dspark.py</code></td>
+                  </tr>
+                  <tr>
+                    <td><b>xLLM</b></td>
+                    <td>NPU 原生实现</td>
+                    <td><code>xllm/python/models/deepseek_v41.py</code>、<code>xllm/python/attention/csa2_attention.py</code>、<code>xllm/python/kernels_npu/dsa.py</code>、设备侧 <code>xllm_ops::compressor</code></td>
+                  </tr>
                 </tbody>
               </table>
             </div>
 
             <div class="callout callout-warn">
-              <span class="callout-label">Bounded Replay 的落地状态</span>
-              encoder 侧已在上游 vLLM 合入。decoder 侧 —— 也就是 CED「prefill 减半」的前提 —— 上游 vLLM 还没合入；
-              vllm-ascend 有实现，开启时要求 MRV2 等条件。xLLM 侧的实现见 <a href="../swa-replay/">SWA 回放</a>，当前是有损的 opt-in 实验。
-            </div>
-          </section>
-
-          <section class="section" id="refs">
-            <span class="section-number">13</span>
-            <h2>依据</h2>
-            <div class="evidence">
-              <div class="table-wrap">
-                <table>
-                  <thead><tr><th>来源</th><th>用来支撑</th></tr></thead>
-                  <tbody>
-                    <tr><td>官方 reference 实现（<code>Block.forward</code>、<code>inference/engram.py</code>）</td><td>Single-Pass mHC 的系数时序、Engram 的哈希与门控</td></tr>
-                    <tr><td>vLLM DeepSeek-V4.1 模型实现</td><td>层角色与 <code>get_kv_cache_spec</code> 返回 None 的非 source 层</td></tr>
-                    <tr><td>vllm-ascend <code>cache_config.py</code> 快照</td><td>A2/A3 与 A5 的缓存格式（推算字节数的依据）</td></tr>
-                    <tr><td>DeepSeek-V4.1-Flash tech report</td><td>890 B/token、计算量曲线、CED 定义、Mega-mHC 访存口径</td></tr>
-                    <tr><td>xLLM <code>xllm/python/models/deepseek_v41.py</code></td><td>xLLM 侧的 CSA2 层计划与各特性开关</td></tr>
-                  </tbody>
-                </table>
-              </div>
+              <span class="callout-label">复核边界声明</span>
+              论文口径的数字（552B / 196B / 8B / 16B / 890 B/token / 1/4 / 1/8 / +1/4、
+              8 头 × 3 阶 × 2048 维、动量 + Sinkhorn、去短因果卷积、16M 项表）<strong>代码侧不可核</strong>，以技术报告为准。
+              本页的代码引用一律带文件名与字段 / 函数名，便于回溯；<strong>不写行号</strong>，因为行号随版本漂移。
+              昇腾侧的绝对字节数标为未核，不在本页给出。
             </div>
           </section>
 
           <nav class="pager" aria-label="相邻页面">
-            <a href="../flashcomm/"><span>下一页</span><b>FlashComm · prefill 通信优化 →</b></a>
-            <a href="../swa-replay/"><span>直接相关</span><b>SWA Bounded Replay · CED 省算的落地 →</b></a>
+            <a href="../"><span>上一页</span><b>← 特性列表</b></a>
+            <a href="../flashcomm/"><span>下一页</span><b>FlashComm1 →</b></a>
           </nav>
         </div>
 
         <aside class="toc" aria-label="本页目录">
           <p>本页目录</p>
           <ol>
-            <li><a href="#overview">一页读懂</a></li>
+            <li><a href="#tldr">一页读懂</a></li>
             <li><a href="#forward">一次前向</a></li>
-            <li><a href="#layers">40 层四种角色</a></li>
-            <li><a href="#csa2">CSA → CSA2</a></li>
-            <li><a href="#dataflow">单层数据流</a></li>
-            <li><a href="#index">分层稀疏索引</a></li>
-            <li><a href="#mhc">mHC</a></li>
+            <li><a href="#layers">40 层角色</a></li>
+            <li><a href="#csa2-evolution">CSA → CSA2</a></li>
+            <li><a href="#dataflow">CSA2 单层数据流</a></li>
+            <li><a href="#sparse-index">分层稀疏索引</a></li>
+            <li><a href="#mhc">mHC 残差</a></li>
             <li><a href="#engram">Engram</a></li>
-            <li><a href="#vision">视觉</a></li>
-            <li><a href="#kv">KV 缓存族</a></li>
+            <li><a href="#vision">多模态</a></li>
+            <li><a href="#kvcache">KV 缓存</a></li>
             <li><a href="#quant">量化</a></li>
             <li><a href="#v4-diff">V4 → V4.1</a></li>
-            <li><a href="#refs">依据</a></li>
+            <li><a href="#glossary">术语与代码线</a></li>
           </ol>
         </aside>
       </div>
@@ -606,7 +1143,7 @@ encoder 3 个 Full 层（ratio 2）: 3 × 356 ÷ 2 = 534 B
     <footer class="site-footer">
       <div class="shell">
         <p><a href="../">← 回到特性列表</a></p>
-        <p>个人整理，非官方文档。标为「推算」「未核」的数字请自行在目标平台复核。</p>
+        <p>两条口径分开写：论文口径以 DeepSeek-V4.1-Flash 技术报告为准，实现口径以代码为准。层号一律自 0 起计数。</p>
       </div>
     </footer>
   </body>

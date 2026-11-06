@@ -1,111 +1,59 @@
-# xLLM DSpark feature page notes
+# DSpark 页 口径（2026-11-06 重写）
 
-## Scope
+内容以内部讲稿为准：`000_DSV4.1/模型结构&知识分享/02_DSV4.1 Dspark/dsv41_dspark.html`（2026-10-24 修订版）。
+上一版页面用的是另一组 benchmark（V4-Flash-0731 的 Baseline / MTP / DSpark 三行对比 + 逐位置接受率表），
+与讲稿口径不一致，这次整页替换。
 
-The page separates three layers that must not be conflated:
+## 为什么换掉旧数据
 
-1. Speculative decoding as a lossless draft-and-verify algorithm.
-2. The full DSpark design from the paper: semi-autoregressive drafting plus
-   confidence-scheduled verification.
-3. The current xLLM DeepSeek-V4-Flash-0731 implementation: a fixed five-token
-   proposal using the parallel backbone and low-rank Markov head, followed by
-   target validation.
+旧页面给的是「DSpark vs MTP vs Baseline」的产品级对比，讲的是特性本身有多好。
+讲稿给的是**我们自己做的三项优化**，每一项都有改前 / 改后、测试条件和边界说明。
+后者更符合本站「代码证据 + 验证强度」的口径，也更有信息量。
 
-The xLLM implementation does not currently load the checkpoint's confidence
-head or implement the hardware-aware prefix scheduler. The page therefore does
-not attribute the paper's online scheduling gains to the current benchmark.
+## 三项优化的数字与条件（页面第 6–8 节）
 
-## Primary references
+| 优化 | 条件 | 结果 |
+|---|---|---|
+| ① draft 成块 | A3、**c=4**、γ=5、MC2 关、draft eager、每组 16 请求 | 每步 115.9 → 89.8 ms（−22.5%）；TPOT 29.0 → 22.9 ms；加权接受率 0.641 → 0.645 |
+| ② target MoE MC2 | A3、**c=1**、γ=5、draft eager | TPOT 21.64 → 20.91 ms（−3.4%）；吞吐 45.44 → 46.87 tok/s；每步 −4.4 ms |
+| ③ draft 入图 | A3、**c=1**、γ=5、greedy | TPOT 20.91 → 15.3 ms（−26.8%）；draft 设备时间 5.3 ms/步 |
 
-- DSpark paper: <https://arxiv.org/abs/2607.05147>
-- DFlash paper: <https://arxiv.org/abs/2602.06036>
-- DeepSpec training repository: <https://github.com/deepseek-ai/DeepSpec>
-- xLLM adaptation PR: <https://github.com/xLLM-AI/xllm/pull/2172>
-- DeepSeek-V4-Flash-0731 W8A8 weights:
-  <https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8>
+页面在三处分别放了「测试条件」callout，并在第 1 节放了一个红色 callout 统一声明：
+**条件不同，百分比不能相加也不能相乘**；`15.3 ms`（压测）与 `79.7 / 55.3 / 5.3 ms`（profile 单分片）
+不是同一次测量，不能用 79.7 ÷ 15.3 反推接受长度。
 
-## Architecture facts used on the page
+两处样本量诚实声明照搬讲稿：
+- 成块的接受率 0.641 → 0.645 在 16 请求的样本内**不可区分**，只能说「没观察到下降」，不能说「提升」；
+- MC2 两组分布有重叠，属小幅收益，建议补重复测量。
 
-- Speculative decoding accepts the longest draft prefix consistent with the
-  target distribution and appends a target-generated bonus/correction token.
-- DSpark uses a parallel backbone to produce all block positions in one model
-  forward, then adds prefix dependence with a lightweight sequential module.
-- The Markov variant uses a rank-256 factorization of a token-to-token
-  transition matrix.
-- The DeepSeek-V4 deployment described by the paper uses three MoE draft
-  layers, sliding-window attention of 128, maximum block size five, and a
-  Markov head.
-- Training freezes the target, vocabulary embedding, and LM head, while
-  optimizing the draft backbone, sequential module, and confidence head.
-- The training objective combines token cross entropy, target-distribution
-  total variation, and confidence prediction, with greater weight on earlier
-  block positions.
+## prelaunch 一节的纪律（页面第 9 节）
 
-## Benchmark source and arithmetic
+`H ≤ 19 ms` 是 `79.7 − 55.3 − 5.3` 的差值，**是上界不是实测**，里面还含 context KV 写、图间空泡、
+engine host 开销。页面用红色 callout 单独声明这一点，并把「先量 H 再决定做不做」写成明确的下一步，
+而不是暗示 prelaunch 已经快好了。
 
-Source: local `results.md` and the acceptance counters collected during the
-DeepSeek-V4-Flash-0731 xLLM adaptation.
+收益模型 `T' = max(V, H) + D` 与两种情形表照写。三种组合（只入图 / 只 prelaunch / 入图+prelaunch）
+的建议也照写，包括「只 prelaunch 净收益可能为负」。
 
-Test setup for the main performance chart:
+## 取点位置那条坑
 
-- Atlas A3, one host, 16 devices
-- DP=4
-- DeepSeek-V4-Flash-0731 W8A8 for DSpark
-- approximately 8,192 input tokens and 1,024 output tokens
-- concurrency 32
+`dspark_target_layer_ids` 在 V4.1 指层**输入**（官方 reference 注释原文：reads the attention input of its
+target layers, not their output），V4 的同名字段指层**输出**。照搬 V4 实现会整体错位一层。
+页面用红色 callout 写了这条，并给了量级（同树同二进制、只差取点位置，接受率差 18 个百分点量级）。
+这是我们实测过的，所以给了量级但没给具体小数 —— 页面不是复现报告，给量级足够。
 
-| Mode | Average TPOT | Output throughput |
-|---|---:|---:|
-| Baseline | 70.1 ms | 422.9513 tok/s |
-| MTP, gamma=1 | 45.1 ms | 613.7594 tok/s |
-| DSpark, gamma=5 | 28.0 ms | 845.7383 tok/s |
+## 适用边界（页面第 10 节）
 
-Derived values:
+greedy、CP=1、全词表 draft、整图要求 draft 自己加载 head 权重、不支持 penalties / JSON_OBJECT / adaptive。
+平台只有 A3 数据，**A5 需要重新确认 page size、算子与图捕获约束**（讲稿原话，照写）。
 
-- TPOT reduction versus baseline:
-  `(70.1 - 28.0) / 70.1 = 60.1%`
-- TPOT reduction versus MTP:
-  `(45.1 - 28.0) / 45.1 = 37.9%`
-- Output-throughput ratio versus baseline:
-  `845.7383 / 422.9513 = 2.00x`
+## 页面做的三件讲稿没做的事
 
-The page deliberately calls this a reference result. DSpark increases TTFT in
-this test, so it is presented as a Decode/long-output optimization rather than
-an unconditional end-to-end win.
+1. 开头加了「先对齐四个词」的 callout（单步耗时 / 接受长度 τ / 接受率 / TPOT），因为后文反复用。
+2. 位置与可见性图重画成 SVG（讲稿是 HTML 表格 + 色块），好处是深浅色自适应、能标注「虚线框是输出不是输入位」。
+3. 图内 / 图外那张图里，把 target verify 标成琥珀色并标注「约 55 ms」，直接说明这张图解决的不是 verify。
 
-## Acceptance metrics
+## 未写进页面
 
-Acceptance data comes from four requests with approximately 30K input tokens
-and 1K output tokens each. There were 951 proposals at gamma five.
-
-| Position | Prefix reaches position | Prefix survival | Conditional acceptance |
-|---:|---:|---:|---:|
-| 0 | 798 / 951 | 83.9% | 83.9% |
-| 1 | 708 / 951 | 74.4% | 708 / 798 = 88.7% |
-| 2 | 625 / 951 | 65.7% | 625 / 708 = 88.3% |
-| 3 | 569 / 951 | 59.8% | 569 / 625 = 91.0% |
-| 4 | 520 / 951 | 54.7% | 520 / 569 = 91.4% |
-
-Additional derived metrics:
-
-- total draft-token acceptance: `3220 / 4755 = 67.7%`
-- mean accepted draft length: `3220 / 951 = 3.39`
-- full five-token block survival: `520 / 951 = 54.7%`
-- mean committed length including the target bonus/correction: approximately
-  `4.39` tokens per decode step
-
-The default chart uses prefix survival because this is what the xLLM
-per-position counters report. The interactive conditional view divides each
-position by the number of prefixes that reached it and is labeled separately.
-
-## Current implementation limits called out on the page
-
-- fixed five-token validation; no confidence scheduler yet
-- `cp_size > 1` not supported
-- end-to-end validation currently centered on Atlas A3 single-host DP4 W8A8
-- native DSpark sparse-attention mode requires explicit operator support;
-  compatibility mode is the default
-- extra draft weights, KV cache, graph state, and workspace increase memory
-- reduced-vocabulary DSpark checkpoints are not supported
-- short-output break-even and broader deployment combinations still require
-  workload-specific validation
+- 讲稿里的 prelaunch 前后时序详图（信息已被「收益模型」一节覆盖，再画一张收益不大）。
+- 训练配方（数据、loss 权重、token 数、学习率）—— 讲稿明确说不在分享范围。

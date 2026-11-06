@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>FlashComm｜xLLM 特性解读</title>
+    <title>FlashComm1｜xLLM 特性解读</title>
     <meta
       name="description"
-      content="xLLM FlashComm：长 prefill 把 row-parallel 线性层后的 AllReduce 换成 ReduceScatter，每个 TP rank 只处理 S/TP 行 token。机制、代码位置、启用方式与适用边界。"
+      content="xLLM FlashComm1：长 prefill 把 row-parallel 层后的 AllReduce 换成 ReduceScatter，让每个 TP rank 只持有约 S/TP 行 token。两条实现线（C++ DeepSeek-V4 / Python DeepSeek-V4.1）的机制、层内边界、准入门禁与验证强度。"
     />
     <meta name="color-scheme" content="light dark" />
     <link rel="stylesheet" href="../assets/site.css" />
@@ -21,7 +21,7 @@
         <nav class="topnav" aria-label="特性导航">
           <a href="../">首页</a>
           <a href="../arch/">V4.1 架构</a>
-          <a href="../flashcomm/" aria-current="page">FlashComm</a>
+          <a href="../flashcomm/" aria-current="page">FlashComm1</a>
           <a href="../dspark/">DSpark</a>
           <a href="../dsa-cp/">DSA CP</a>
           <a href="../swa-replay/">SWA 回放</a>
@@ -37,17 +37,19 @@
     <main id="main">
       <section class="hero">
         <div class="shell">
-          <p class="eyebrow">01 / Prefill 通信优化</p>
-          <h1>FlashComm：让每个 TP rank 只处理自己那份 token</h1>
+          <p class="eyebrow">02 / Prefill 序列并行</p>
+          <h1>FlashComm1：让每个 TP rank 只处理自己那份 token</h1>
           <p class="hero-lede">
-            问题不是「算不动」，是「重复做」。Tensor Parallel 把权重切开了，但 row-parallel 线性层后的 <code>AllReduce</code>
-            又让每个 rank 拿回一份完整序列。FlashComm 把这一步换成 <code>ReduceScatter</code>：
-            通信在求和的同时就完成了按 token 的切分，之后的安全区段每个 rank 只留约 <code>S/TP</code> 行。
+            Tensor Parallel 把权重切开了，但 row-parallel 线性层后的 <code>AllReduce</code> 又让每个 rank 拿回一份完整序列。
+            于是 <code>TP</code> 个 rank 对同一批 token 把归一化、残差混合这些逐 token 的工作各做一遍。
+            FlashComm1 把这一步换成 <code>ReduceScatter</code>：求和的同时就按 token 行切好，
+            之后到下一个"必须看完整序列"的边界之前，每个 rank 只留约 <code>S/TP</code> 行。
           </p>
           <ul class="chips">
-            <li class="chip chip-good">已实现</li>
+            <li class="chip chip-good">已实现（两条线）</li>
             <li class="chip chip-warn">默认关闭</li>
-            <li class="chip chip-info">仅 prefill · 仅 NPU</li>
+            <li class="chip chip-info">仅 prefill</li>
+            <li class="chip chip-bad">与 DSA CP 互斥（V4.1）</li>
           </ul>
         </div>
       </section>
@@ -61,186 +63,445 @@
             <div class="summary">
               <div>
                 <dt>解决什么问题</dt>
-                <dd>长 prompt 的 prefill 里，TP 组内每个 rank 都持有并处理完整的 <code>[S, H]</code> 序列，通信量和可分片区段的计算量都是重复的。</dd>
+                <dd>
+                  长 prompt 的 prefill 里，TP 组内每个 rank 都持有完整的 <code>[S, H]</code> 激活。
+                  逐 token 的那部分工作（RMSNorm、mHC 残差混合、逐行写回）和中间激活的显存，都被重复了 <code>TP</code> 份。
+                </dd>
               </div>
               <div>
                 <dt>做了什么</dt>
-                <dd>把 row-parallel 层后的 <code>all_reduce</code> 改成 <code>reduce_scatter</code>，在需要完整序列的边界处再 gather 还原。可选再把 matmul 和 reduce_scatter 融成一个算子。</dd>
+                <dd>
+                  把 row-parallel 层后的 <code>all_reduce</code> 换成 <code>reduce_scatter</code>，
+                  在必须看完整序列的两个边界（attention、MoE 路由）处再 gather 还原。
+                </dd>
               </div>
               <div>
                 <dt>什么时候开</dt>
-                <dd>NPU 后端、长输入 prefill（默认阈值 8192 token）、<code>cp_size=1</code>、prefill 在端到端时延里占比高（如 8K/128、32K/1K）。</dd>
+                <dd>
+                  长输入 prefill（默认阈值 8192 token）、TTFT 是主要指标、<code>TP &gt; 1</code>。
+                  输入越长、TP 越大，被省掉的重复工作越多。
+                </dd>
               </div>
               <div>
                 <dt>什么时候别开</dt>
-                <dd>短输入（低于阈值不会触发）、长输出 / decode 占比高的场景、<code>cp &gt; 1</code>。它不改 decode 路径，不要指望 TPOT 直接受益。</dd>
+                <dd>
+                  短输入（低于阈值不触发）、decode 或长输出占主导、只看 TPOT 的场景。
+                  它完全不介入 decode 循环，<strong>不要指望 TPOT 受益</strong>。
+                </dd>
               </div>
             </div>
 
-            <div class="callout callout-warn">
-              <span class="callout-label">先说清楚适用的模型范围</span>
-              FlashComm 的上下文由模型 forward 建立。当前仓里建立这个 scope 的只有两处：
-              <code>xllm/models/llm/deepseek_v4.h</code>（DeepSeek-V4，C++ 路径）和
-              <code>xllm/models/llm/qwen3_next_hybrid_base.h</code>（Qwen3-Next）。
-              <strong>Python 路径的 DeepSeek-V4.1 没有建立这个 scope，给它传 <code>--enable_flashcomm1</code> 不会生效。</strong>
-            </div>
-          </section>
+            <h3>仓里有两条独立的实现线</h3>
+            <p>
+              同一个开关名 <code>--enable_flashcomm1</code>，背后是两套各自独立的代码。
+              读这一页之前先确认你在哪条线上，否则门禁条件和收益口径都会对不上。
+            </p>
 
-          <section class="section wide" id="mechanism">
-            <span class="section-number">02</span>
-            <h2>机制：一次 collective 同时完成求和与切分</h2>
-            <p class="section-note">输入 → 处理 → 输出。</p>
-
-            <figure>
-              <svg viewBox="0 0 860 320" role="img" aria-label="Baseline 用 AllReduce 后每个 rank 持有完整序列；FlashComm 用 ReduceScatter 后每个 rank 只持有 S/TP 行" class="dg">
-                <text class="dg-t" x="20" y="24">Baseline</text>
-                <text class="dg-t-sm" x="20" y="42">local Matmul partial → TP AllReduce</text>
-                <rect class="dg-box" x="20" y="54" width="300" height="86" rx="6" />
-                <text class="dg-t-mono" x="34" y="78">TP0</text><rect class="dg-box-accent" x="76" y="66" width="228" height="14" rx="3" />
-                <text class="dg-t-mono" x="34" y="100">TP1</text><rect class="dg-box-accent" x="76" y="88" width="228" height="14" rx="3" />
-                <text class="dg-t-mono" x="34" y="122">TP2</text><rect class="dg-box-accent" x="76" y="110" width="228" height="14" rx="3" />
-                <text class="dg-t-sm" x="20" y="162">每个 rank 都持有完整的 [S, H]</text>
-                <text class="dg-t-sm" x="20" y="180">→ 后续可分片区段被重复处理 TP 次</text>
-
-                <path class="dg-line-accent" d="M350 100 h60" />
-                <path class="dg-fill-accent" d="M412 100 l-9 -5 v10 z" />
-                <text class="dg-t-key" x="380" y="88" text-anchor="middle">AR → RS</text>
-
-                <text class="dg-t" x="440" y="24">FlashComm</text>
-                <text class="dg-t-sm" x="440" y="42">local Matmul partial → TP ReduceScatter</text>
-                <rect class="dg-box-good" x="440" y="54" width="300" height="86" rx="6" />
-                <text class="dg-t-mono" x="454" y="78">TP0</text><rect class="dg-box-accent" x="496" y="66" width="76" height="14" rx="3" />
-                <text class="dg-t-mono" x="454" y="100">TP1</text><rect class="dg-box-accent" x="572" y="88" width="76" height="14" rx="3" />
-                <text class="dg-t-mono" x="454" y="122">TP2</text><rect class="dg-box-accent" x="648" y="110" width="76" height="14" rx="3" />
-                <text class="dg-t-sm" x="440" y="162">每个 rank 只持有 [S/TP, H]</text>
-                <text class="dg-t-sm" x="440" y="180">→ 各 rank 的分片拼起来刚好覆盖 S</text>
-
-                <rect class="dg-box-dim" x="20" y="208" width="720" height="92" rx="6" />
-                <text class="dg-t" x="36" y="232">一层里的边界（DeepSeek-V4）</text>
-                <text class="dg-t-sm" x="36" y="254">① Attention 前 gather 回完整序列　② DSAttention 的 row-parallel 输出用 ReduceScatter，输出 local shard</text>
-                <text class="dg-t-sm" x="36" y="272">③ HC residual 区段在 local shard 上执行　④ MoE gate 前 gather 回完整序列（保证路由语义不变）</text>
-                <text class="dg-t-sm" x="36" y="290">⑤ MoE 输出后按序列重新切片，进入下一层</text>
-              </svg>
-              <figcaption>
-                模型级：完整 hidden states → <code>shard_sequence()</code> → TP-local rows → decoder layers → <code>gather_sequence()</code> → 完整 hidden states → final head。
-              </figcaption>
-            </figure>
-
-            <h3>两层能力，收益来源不同</h3>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>能力</th><th>做法</th><th>覆盖范围</th><th>地位</th></tr></thead>
+                <thead>
+                  <tr><th>实现线</th><th>覆盖模型</th><th>核心类型</th><th>切分载体</th></tr>
+                </thead>
                 <tbody>
                   <tr>
-                    <td><b>序列维度分片</b></td>
-                    <td><code>all_reduce</code> → <code>reduce_scatter</code>，边界处 gather 还原</td>
-                    <td>所有 dtype（BF16 与各类量化）</td>
-                    <td><b>核心，收益主要来源</b></td>
+                    <td><b>C++ 线</b></td>
+                    <td>DeepSeek-V4（<code>models/llm/deepseek_v4.h</code>）、Qwen3-Next（<code>qwen3_next_hybrid_base.h</code>）</td>
+                    <td><code>FlashComm1Context</code> + thread-local <code>FlashComm1ContextScope</code></td>
+                    <td>TP group 内的 <code>reduce_scatter</code> / <code>gather</code>，可选 MMRS 融合算子</td>
                   </tr>
                   <tr>
-                    <td><b>MMRS 融合算子</b></td>
-                    <td><code>matmul + reduce_scatter</code> → <code>npu_mm_reduce_scatter_base</code></td>
-                    <td>BF16 与 w8a8_dynamic 两条路径</td>
-                    <td>可选增量，默认关闭</td>
+                    <td><b>Python 线</b></td>
+                    <td>DeepSeek-V4.1（<code>python/models/deepseek_v41.py</code>）、Qwen3.5、Kimi-K3</td>
+                    <td><code>SpMetadata</code> + <code>EpSpTokenLayout</code>（显式传参，无 thread-local）</td>
+                    <td>TP <code>reduce_scatter</code> / <code>all_gather</code>，MoE 侧换成 EP 组的 gather / reduce-scatter</td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
-            <h3>两个实现细节</h3>
+            <div class="callout callout-warn">
+              <span class="callout-label">修正一条过期结论</span>
+              <p>
+                在 <a href="https://github.com/xLLM-AI/xllm/pull/686" target="_blank" rel="noreferrer">#686</a>
+                （<code>feat: swa bounded replay &amp; fc1 support.</code>，2026-11-05）之前，
+                建立 FlashComm1 作用域的只有 <code>deepseek_v4.h</code> 和 <code>qwen3_next_hybrid_base.h</code> 两处，
+                <strong>Python 路径的 DeepSeek-V4.1 给 <code>--enable_flashcomm1</code> 确实不生效</strong>。
+              </p>
+              <p>
+                #686 之后 V4.1 有了自己的 Python 实现（<code>build_flashcomm1_layout</code> → <code>sp_shard</code> → 层内边界）。
+                <strong>如果你手上有 2026-11-05 之前的 V4.1 profile，上面那条"开关无效"的判断对那次测量仍然成立，
+                但不能再用于当前代码。</strong>
+              </p>
+            </div>
+          </section>
+
+          <section class="section wide" id="why">
+            <span class="section-number">02</span>
+            <h2>机制：一次 collective 同时完成求和与切分</h2>
+            <p class="section-note">先说清楚被省掉的到底是什么，再看怎么省。</p>
+
+            <h3>AllReduce 省不掉重复，只是把重复藏起来了</h3>
+            <p>
+              row-parallel 线性层把权重按输入维切开，每个 rank 算出的是一份<strong>部分和</strong>（partial sum），
+              形状仍是完整的 <code>[S, H]</code>。要拿到正确结果必须跨 rank 相加。
+              <code>AllReduce</code> 相加之后把<strong>同一份完整结果</strong>发给每个 rank，于是：
+            </p>
             <ul>
-              <li>
-                <strong>Padding</strong>：全局 token 数向上补齐到 <code>TP × 16</code> 的倍数（<code>kFc1LocalTokenAlignment = 16</code>），
-                保证各 rank 的 collective 等长；最终 gather 后截回真实 token 数。
-              </li>
-              <li>
-                <strong>Fallback</strong>：MMRS 的 dtype、shape、bias 或运行条件不满足时，退回普通 matmul + reduce_scatter。
-                数值一致，只是少了 kernel 融合，<strong>FlashComm 的核心语义仍然成立</strong>。
-              </li>
+              <li>通信量：每个 rank 收发完整的 <code>S × H</code>；</li>
+              <li>后续计算：下一个 row-parallel 层之前的那些<strong>逐 token、不跨 token</strong>的算子（RMSNorm、残差加、mHC 的折叠与展开），每个 rank 都对全部 <code>S</code> 行各做一遍；</li>
+              <li>显存：这段区间的中间激活在每个 rank 上各存一份完整副本。</li>
             </ul>
+            <p>
+              <code>ReduceScatter</code> 做的是同一次求和，但只把第 <code>r</code> 份切片发给 rank <code>r</code>。
+              通信量降到约 <code>1/TP</code>，而且输出天然就是切好的，后面那段逐 token 的工作每个 rank 只做自己的
+              <code>S/TP</code> 行。
+            </p>
+
+            <figure>
+              <svg viewBox="0 0 860 358" role="img" aria-label="Baseline 用 AllReduce 后每个 TP rank 持有完整序列；FlashComm1 用 ReduceScatter 后每个 rank 只持有互不重叠的 S/TP 行" class="dg">
+                <text class="dg-t" x="18" y="20">Baseline · AllReduce</text>
+                <text class="dg-t-sm" x="18" y="37">每个 rank 都拿回完整的 [S, H]</text>
+                <rect class="dg-box" x="18" y="48" width="372" height="128" rx="6" />
+                <text class="dg-t-mono" x="32" y="74">rank0</text><rect class="dg-box-accent" x="84" y="62" width="292" height="16" rx="3" />
+                <text class="dg-t-mono" x="32" y="100">rank1</text><rect class="dg-box-accent" x="84" y="88" width="292" height="16" rx="3" />
+                <text class="dg-t-mono" x="32" y="126">rank2</text><rect class="dg-box-accent" x="84" y="114" width="292" height="16" rx="3" />
+                <text class="dg-t-mono" x="32" y="152">rank3</text><rect class="dg-box-accent" x="84" y="140" width="292" height="16" rx="3" />
+                <text class="dg-t-sm" x="18" y="196">同一批 token 的归一化 / 残差混合被做了 4 遍</text>
+
+                <path class="dg-line-accent" d="M404 112 h52" />
+                <path class="dg-fill-accent" d="M458 112 l-9 -5 v10 z" />
+                <text class="dg-t-key" x="430" y="100" text-anchor="middle">AR → RS</text>
+
+                <text class="dg-t" x="478" y="20">FlashComm1 · ReduceScatter</text>
+                <text class="dg-t-sm" x="478" y="37">每个 rank 只持有 [S/TP, H]，互不重叠</text>
+                <rect class="dg-box-good" x="478" y="48" width="364" height="128" rx="6" />
+                <text class="dg-t-mono" x="492" y="74">rank0</text><rect class="dg-box-accent" x="544" y="62" width="70" height="16" rx="3" />
+                <text class="dg-t-mono" x="492" y="100">rank1</text><rect class="dg-box-accent" x="616" y="88" width="70" height="16" rx="3" />
+                <text class="dg-t-mono" x="492" y="126">rank2</text><rect class="dg-box-accent" x="688" y="114" width="70" height="16" rx="3" />
+                <text class="dg-t-mono" x="492" y="152">rank3</text><rect class="dg-box-accent" x="760" y="140" width="70" height="16" rx="3" />
+                <text class="dg-t-sm" x="478" y="196">4 份切片拼起来刚好覆盖 S，没有一行被算两次</text>
+
+                <rect class="dg-box-dim" x="18" y="216" width="824" height="128" rx="6" />
+                <text class="dg-t" x="34" y="240">补齐（padding）：为什么要对齐到 TP × 16</text>
+                <text class="dg-t-sm" x="34" y="262">collective 要求各 rank 等长，所以先把行数向上补齐到 tp_world_size × 16（kFc1LocalTokenAlignment = 16），</text>
+                <text class="dg-t-sm" x="34" y="280">补出来的行填 0；每个 rank 的本地行数 padded_local = padded / tp_world_size。</text>
+                <text class="dg-t-sm" x="34" y="304">最后一次 gather_sequence 之后按 original_num_tokens 截回真实行数，补齐行不进入输出。</text>
+                <text class="dg-t-sm" x="34" y="328">所以短序列不划算：补齐的占比越大，被省掉的真实工作越少 —— 这就是 min_prefill_tokens 阈值存在的原因。</text>
+              </svg>
+              <figcaption>
+                模型级：完整 hidden → <code>shard_sequence()</code> → TP-local rows → 40 层 → <code>gather_sequence()</code> → 完整 hidden → final norm / head。
+              </figcaption>
+            </figure>
 
             <div class="callout callout-info">
               <span class="callout-label">为什么这能变成 TTFT 收益</span>
-              AllReduce 复制完整序列 → 多个 TP rank 重复处理相同 token → 长 prefill 的通信和可分片计算成本偏高。
-              ReduceScatter 在归并时直接完成序列分片 → 安全区段每 rank 只处理约 <code>S/TP</code> 行 →
+              通信量降到约 <code>1/TP</code>，安全区段的逐 token 计算也降到约 <code>1/TP</code> →
               prompt forward 更早结束 → LM head 和采样更早拿到首 token → 用户更早看到第一个字。
             </div>
 
             <div class="callout callout-bad">
-              <span class="callout-label">表述边界</span>
-              <p>这是「减少重复的 token 处理和中间激活复制」，<strong>不是</strong>「所有算力严格下降到 1/TP」。</p>
-              <p>decoder 末尾的 token-layout gather，和 LM head 的词表并行 logits 归并，是两件不同的事，不要混为一谈。</p>
+              <span class="callout-label">三句不要说的话</span>
+              <p><strong>不要说</strong>"算力严格降到 1/TP"。attention 和 MoE 专家计算这两段必须看完整序列，它们的工作量一行都没少。省的是边界之间那段逐 token 的工作，加上通信量。</p>
+              <p><strong>不要说</strong>"它是上下文并行（CP）"。CP 切的是序列、跨 rank 分摊 attention 的 KV；FlashComm1 切的是 row-parallel 之后的激活行，attention 仍在完整序列上算。两者在 C++ 线上可以叠加（见<a href="#gate">第 5 节</a>）。</p>
+              <p><strong>不要把</strong> decoder 末尾的 token-layout gather 和 LM head 的词表并行 logits 归并混为一谈，那是两件事。</p>
             </div>
           </section>
 
-          <section class="section wide" id="evidence">
+          <section class="section wide" id="boundary">
             <span class="section-number">03</span>
+            <h2>层内边界：哪几段在切片上跑</h2>
+            <p class="section-note">
+              FlashComm1 的全部难点就在这张图上：哪些算子可以在切片上算，哪些必须先还原完整序列。
+              判据只有一条 —— <strong>这个算子要不要跨 token 看别的行</strong>。
+            </p>
+
+            <figure>
+              <svg viewBox="0 0 860 392" role="img" aria-label="Python DeepSeek-V4.1 一层内部的切片区段与完整序列区段划分" class="dg">
+                <text class="dg-t" x="18" y="20">Python DeepSeek-V4.1 · 一层内部（sp_metadata 非空时）</text>
+
+                <rect class="dg-box-accent" x="18" y="36" width="824" height="22" rx="4" />
+                <text class="dg-t-mono" x="28" y="51">切片区段 [local_rows, …]　只做逐 token 的事，不跨行</text>
+
+                <rect class="dg-box" x="18" y="72" width="198" height="46" rx="5" />
+                <text class="dg-t" x="28" y="90">① Engram 注入</text>
+                <text class="dg-t-sm" x="28" y="108">gather → engram → shard</text>
+
+                <rect class="dg-box-accent" x="224" y="72" width="178" height="46" rx="5" />
+                <text class="dg-t" x="234" y="90">② mHC 系数 + hc_pre</text>
+                <text class="dg-t-sm" x="234" y="108">切片上算，4→1 折叠</text>
+
+                <rect class="dg-box-accent" x="410" y="72" width="146" height="46" rx="5" />
+                <text class="dg-t" x="420" y="90">③ input_layernorm</text>
+                <text class="dg-t-sm" x="420" y="108">逐行，切片上算</text>
+
+                <rect class="dg-box-amber" x="564" y="72" width="278" height="46" rx="5" />
+                <text class="dg-t" x="574" y="90">④ Attention（必须完整序列）</text>
+                <text class="dg-t-sm" x="574" y="108">sp_all_gather → CSA2 → o_b_proj 做 reduce_scatter</text>
+
+                <path class="dg-line" d="M216 95 h8" /><path class="dg-fill-line" d="M226 95 l-7 -4 v8 z" />
+                <path class="dg-line" d="M402 95 h8" /><path class="dg-fill-line" d="M412 95 l-7 -4 v8 z" />
+                <path class="dg-line" d="M556 95 h8" /><path class="dg-fill-line" d="M566 95 l-7 -4 v8 z" />
+
+                <path class="dg-line-accent" d="M700 122 v18 h-520 v18" />
+                <path class="dg-fill-accent" d="M180 162 l-5 -9 h10 z" />
+                <text class="dg-t-key" x="430" y="137" text-anchor="middle">输出回到切片 [local_rows]</text>
+
+                <rect class="dg-box-accent" x="18" y="168" width="162" height="46" rx="5" />
+                <text class="dg-t" x="28" y="186">⑤ hc_post</text>
+                <text class="dg-t-sm" x="28" y="204">1→4 展开，切片上算</text>
+
+                <rect class="dg-box-accent" x="188" y="168" width="150" height="46" rx="5" />
+                <text class="dg-t" x="198" y="186">⑥ hc_pre（FFN 子块）</text>
+                <text class="dg-t-sm" x="198" y="204">错位一拍复用系数</text>
+
+                <rect class="dg-box-amber" x="346" y="168" width="330" height="46" rx="5" />
+                <text class="dg-t" x="356" y="186">⑦ MoE（必须完整序列）</text>
+                <text class="dg-t-sm" x="356" y="204">ep_gather_tokens → 路由 + 专家 → ep_reduce_scatter</text>
+
+                <rect class="dg-box-accent" x="684" y="168" width="158" height="46" rx="5" />
+                <text class="dg-t" x="694" y="186">⑧ hc_post</text>
+                <text class="dg-t-sm" x="694" y="204">切片上算，交下一层</text>
+
+                <path class="dg-line" d="M180 191 h8" /><path class="dg-fill-line" d="M190 191 l-7 -4 v8 z" />
+                <path class="dg-line" d="M338 191 h8" /><path class="dg-fill-line" d="M348 191 l-7 -4 v8 z" />
+                <path class="dg-line" d="M676 191 h8" /><path class="dg-fill-line" d="M686 191 l-7 -4 v8 z" />
+
+                <rect class="dg-box-dim" x="18" y="236" width="824" height="146" rx="6" />
+                <text class="dg-t" x="34" y="260">两个边界为什么推不掉</text>
+                <text class="dg-t-sm" x="34" y="282">Attention：第 i 行要看第 0…i 行的 KV，跨 token。切片上算不出正确结果，必须 all_gather 回完整序列。</text>
+                <text class="dg-t-sm" x="34" y="300">　　出口的 o_b_proj 是 row-parallel，正好可以把 all_reduce 换成 reduce_scatter —— 一次通信同时完成归并和切回切片。</text>
+                <text class="dg-t-sm" x="34" y="324">MoE：gate 的路由分数逐行独立，但专家计算在 EP 组内按专家切分，token 要按路由结果发到持有该专家的 rank。</text>
+                <text class="dg-t-sm" x="34" y="342">　　所以 MoE 的 gather / reduce-scatter 走 moe_ep 组而不是 tp 组，由 EpSpTokenLayout 描述每个 (dp, tp) rank 的行数。</text>
+                <text class="dg-t-sm" x="34" y="366">共享专家（shared expert）在 moe_tp_size=1 下是各 rank 复制的，所以它只在本地有效行上跑，在 EP 归并之后再加回去。</text>
+              </svg>
+              <figcaption>
+                C++ 线（DeepSeek-V4）的边界同构但更粗：<code>deepseek_v4_decoder_layer.cpp</code> 里只有三处 ——
+                attention 前 <code>gather_sequence</code>、MoE gate 前 <code>gather_sequence</code>、MoE 输出后 <code>shard_sequence</code>。
+              </figcaption>
+            </figure>
+
+            <h3>一个容易写错的细节：bias 必须在 reduce_scatter 之后加</h3>
+            <p>
+              <code>sp_row_parallel_projection</code> 的顺序是 <code>matmul → sp_reduce_scatter → + bias</code>。
+              row-parallel 层的 bias 只能加一次；如果在归并前加，<code>TP</code> 个 rank 各加一份，求和之后就变成 <code>TP</code> 倍。
+            </p>
+            <pre><code>def sp_row_parallel_projection(linear, value, layout):
+    partial = ...                      # 各 rank 的部分和，完整 S 行
+    output = sp_reduce_scatter(partial, layout)   # 归并 + 切片
+    if linear.bias is not None:
+        output = output + linear.bias  # 切片上加一次
+    return output</code></pre>
+          </section>
+
+          <section class="section wide" id="evidence">
+            <span class="section-number">04</span>
             <h2>代码证据</h2>
-            <p class="section-note">想自己读源码时从这几个文件进。</p>
+            <p class="section-note">想自己读源码时从这几个文件进。路径相对仓根。</p>
 
             <div class="evidence">
+              <h4>C++ 线</h4>
               <div class="table-wrap">
                 <table>
                   <thead><tr><th>文件</th><th>负责什么</th></tr></thead>
                   <tbody>
-                    <tr><td>core/common/flash_comm1_context.{h,cpp}</td><td>启用门槛、padding 对齐、shard / gather / reduce-scatter；<code>FlashComm1ContextScope</code> 是 thread-local 作用域</td></tr>
-                    <tr><td>models/llm/deepseek_v4.h</td><td>DeepSeek-V4 的模型级 context、首尾 shard/gather、final head 边界</td></tr>
-                    <tr><td>models/llm/qwen3_next_hybrid_base.h</td><td>Qwen3-Next 的模型级 context</td></tr>
-                    <tr><td>core/layers/deepseek_v4_decoder_layer.cpp</td><td>Attention / MoE 的完整序列边界</td></tr>
-                    <tr><td>core/layers/common/linear.cpp</td><td>row-parallel reduce mode、BF16 / W8A8-dynamic 的 MMRS 与 fallback</td></tr>
-                    <tr><td>core/runtime/worker_impl.cpp</td><td>把运行时 options 传进 FlashComm 配置</td></tr>
+                    <tr><td>xllm/core/common/flash_comm1_context.{h,cpp}</td><td>准入判定、padding 几何、<code>shard_sequence</code> / <code>gather_sequence</code> / <code>maybe_pad_and_reduce</code>；<code>FlashComm1ContextScope</code> 是 thread-local 作用域</td></tr>
+                    <tr><td>xllm/models/llm/deepseek_v4.h</td><td>V4 的模型级 context、CP 与 FC1 的组合几何、首尾 shard / gather</td></tr>
+                    <tr><td>xllm/models/llm/qwen3_next_hybrid_base.h</td><td>Qwen3-Next 的模型级 context</td></tr>
+                    <tr><td>xllm/core/layers/deepseek_v4_decoder_layer.cpp</td><td>层内三处边界：attention 前、MoE gate 前、MoE 输出后</td></tr>
+                    <tr><td>xllm/core/layers/common/linear.cpp</td><td>row-parallel reduce mode；BF16 与 w8a8_dynamic 两条 MMRS 路径及其 fallback</td></tr>
+                    <tr><td>xllm/core/framework/config/kernel_config.cpp</td><td>四个 gflag 的定义与默认值</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <h4>Python 线</h4>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>文件 / 符号</th><th>负责什么</th></tr></thead>
+                  <tbody>
+                    <tr><td>python/layers/sequence_parallel_metadata.py<br /><code>build_flashcomm1_layout</code></td><td>每步准入：图 / decode / spec-verify 一律不走；DP 副本投票；阈值判定。返回 <code>SpMetadata</code> 或 <code>None</code></td></tr>
+                    <tr><td>同上<br /><code>SpMetadata</code> / <code>EpSpTokenLayout</code></td><td>TP 切片几何（<code>local_rows</code> / <code>valid_rows</code> / <code>local_offset</code>）与 EP 分发行数</td></tr>
+                    <tr><td>python/layers/sequence_parallel.py</td><td><code>sp_shard</code> / <code>sp_all_gather</code> / <code>sp_reduce_scatter</code> / <code>sp_row_parallel_projection</code></td></tr>
+                    <tr><td>python/layers/moe_parallel.py</td><td><code>ep_gather_tokens</code> / <code>ep_reduce_scatter</code> / <code>ep_apply_local</code>，含变长分发的 padding 重排</td></tr>
+                    <tr><td>python/models/deepseek_v41.py<br /><code>_validate_flashcomm1</code></td><td>启动期静态门禁，不满足就把 <code>cfg.enable_flashcomm1</code> 置 False 并打 warning</td></tr>
+                    <tr><td>同上<br /><code>DeepseekV41Model.forward</code></td><td>模型级 <code>sp_shard</code>、层循环中的 aux capture / SWA 回放还原、末尾 <code>sp_all_gather</code></td></tr>
+                    <tr><td>同上<br /><code>_forward_flashcomm1</code></td><td>MoE 的 EP gather / 路由 / 专家 / reduce-scatter，共享专家在本地有效行上单独跑</td></tr>
                   </tbody>
                 </table>
               </div>
             </div>
+
+            <div class="callout callout-info">
+              <span class="callout-label">判断它有没有真的生效</span>
+              Python 线在首次激活时打一条一次性日志：
+              <code>FLASHCOMM1_ACTIVE rows=… local=… tp=… ep_dispatch=…</code>。
+              <strong>这条日志只打一次</strong>（<code>_flashcomm1_logged</code> 一次性标记），
+              所以它只能证明"至少激活过一次"，不能证明稳态每步都在走。
+              要确认稳态行为，得看逐步的 metadata 或自己加计数。
+            </div>
+          </section>
+
+          <section class="section wide" id="gate">
+            <span class="section-number">05</span>
+            <h2>准入门禁：三层，任一层不过就静默走原路径</h2>
+            <p class="section-note">
+              两条线都遵守同一个纪律：<strong>不满足条件就回退到原执行路径，不报错、不崩</strong>。
+              代价是"开了没生效"很难自己发现，所以这一节值得读完。
+            </p>
+
+            <h3>第一层 · 启动期静态门禁（仅 Python 线）</h3>
+            <p>
+              <code>_validate_flashcomm1</code> 在建模型时跑一次。任一条不满足，就把开关置回 False 并打 warning，之后整个进程都不再尝试。
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>条件</th><th>为什么</th></tr></thead>
+                <tbody>
+                  <tr><td><code>quant_mode == 昇腾 W8A8</code></td><td>切片路径上的 MoE 只实现了 V4.1 的 W8A8 bias 路由 + 分组专家计算</td></tr>
+                  <tr><td><code>tp_size &gt; 1</code></td><td>TP=1 时没有可切的对象</td></tr>
+                  <tr><td><code>cp_size == 1</code> 且 <code>enable_dsa_cp == False</code></td><td>这两个也在切 token 轴，叠加会把序列切两次</td></tr>
+                  <tr><td><code>moe_tp_size == 1</code></td><td>共享专家要是各 rank 复制的，才能只在本地有效行上跑</td></tr>
+                  <tr><td><code>ep_size == tp_size × dp_size</code><br /><code>ep_rank == dp_rank × tp_size + tp_rank</code></td><td>EP 的 rank 排布必须是 DP-major，否则 <code>EpSpTokenLayout</code> 算出的分发行数对不上实际 rank</td></tr>
+                  <tr><td><code>first_k_dense_replace == 0</code> 且 <code>moe_layer_freq &lt;= 1</code></td><td>要求全部层都是 MoE 层；dense 层没有这条 EP 归并路径</td></tr>
+                  <tr><td><code>flashcomm1_min_prefill_tokens &gt;= 2</code></td><td>阈值小于 2 没有意义</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="callout callout-bad">
+              <span class="callout-label">实际部署里最容易踩的一条</span>
+              <p>
+                <strong><code>enable_dsa_cp</code> 和 <code>enable_flashcomm1</code> 在 V4.1 上是互斥的。</strong>
+                两个都传 true，结果是 FlashComm1 被静默关掉（只留一条 warning），DSA CP 照常生效。
+              </p>
+              <p>
+                如果你的部署脚本里两个开关都在，那 FlashComm1 从来没跑过。
+                启动日志里搜 <code>V4.1 FlashComm1 disabled</code> 就能确认。
+                两者的取舍见 <a href="../dsa-cp/">DSA CP</a> 那一页：它们切的是同一个 token 轴，收益不可叠加估算。
+              </p>
+            </div>
+
+            <h3>第二层 · 拓扑与运行条件</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th></th><th>C++ 线</th><th>Python 线</th></tr></thead>
+                <tbody>
+                  <tr><td>阶段</td><td>prefill（<code>batch_forward_type.no_decode()</code>）</td><td>prefill 或 chunked prefill</td></tr>
+                  <tr><td>图模式</td><td>ACL graph forward 时跳过</td><td><code>context.acl_graph is not None</code> 时返回 None</td></tr>
+                  <tr><td>投机验证</td><td>—</td><td><code>is_spec_verify</code> 时返回 None</td></tr>
+                  <tr><td>DSpark aux capture</td><td><code>aux_capture_.enabled()</code> 时跳过（逐层捕获需要完整本地 token 集）</td><td>不跳过，改为在捕获点 <code>sp_all_gather</code> 还原</td></tr>
+                  <tr><td>CP 组合</td><td><b>支持</b>：CP 外、FC1 内</td><td>不支持（见上）</td></tr>
+                  <tr><td>后端</td><td>仅 NPU（非 NPU 编译直接返回空 context）</td><td>仅昇腾 W8A8</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h4>C++ 线怎么和 CP 组合</h4>
+            <p>
+              CP 和 FC1 都切 token 轴，但切的组不同（<code>cp_group</code> vs <code>tp_group</code>），
+              在 rank 排布 <code>dp_rank × (cp_size × tp_size) + cp_rank × tp_size + tp_rank</code> 里这两个维度是正交的。
+              只要 <strong>CP 在外、FC1 在内</strong>就能组合：CP 先把 batch 切到各 cp_rank，FC1 再把每个 cp_rank 的行切到各 tp_rank。
+              代码为此把原来混用的一个 token 数拆成三个：
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>字段</th><th>含义</th><th>用途</th></tr></thead>
+                <tbody>
+                  <tr><td><code>global_num_tokens</code></td><td>CP 切分之前的 DP-local batch，CP 组内每个 rank 相同</td><td><strong>阈值判定用它</strong>，保证开关决策在整个 CP 组内一致</td></tr>
+                  <tr><td><code>local_num_tokens</code></td><td>本 rank 在 CP 切分之后的行数</td><td>所有 padding 几何用它，并成为 <code>ctx.original_num_tokens</code></td></tr>
+                  <tr><td><code>min_local_num_tokens</code></td><td>CP 组内最小的 <code>local_num_tokens</code></td><td>组合门槛：必须 <code>&gt;= tp_world_size × 16</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>
+              最后一条的原因：V4 的 CP 切分是按序列连续切的，段长不均，短 batch 会让高 cp_rank 只剩很少甚至 0 行。
+              每个 rank 都能从全局 <code>q_seq_lens</code> 自己推出这个最小值（不需要通信），
+              所以用它做门槛可以让 FC1 在整个 CP 组内要么全开要么全关，不会出现一部分 rank 切了、另一部分没切。
+            </p>
+
+            <div class="callout callout-warn">
+              <span class="callout-label">CP 开着时 MMRS 会被强制关掉</span>
+              <code>ctx.enable_mmrs_fusion = options.enable_mmrs_fusion &amp;&amp; !cp_active</code>。
+              融合算子本来就对 shape 敏感（这也是它默认关闭的原因），CP 之后的本地行数更小更不规整。
+              非融合的 <code>reduce_scatter</code> 路径数值等价，所以在 CP-local shape 上测过之前先用它。
+            </div>
+
+            <h3>第三层 · Python 线的每步 DP 投票</h3>
+            <p>
+              Python 线的决策必须在所有 DP 副本上一致 —— MoE 的 EP 集合通信是整组参与的，
+              一个副本切了另一个没切，分发行数就对不上。<code>build_flashcomm1_layout</code> 的做法：
+            </p>
+            <ul class="steps">
+              <li>
+                <h4>先挑出"活跃"副本</h4>
+                <p><code>raw_dp_execution_token_counts</code> 大于 0 的副本才算活跃。空闲副本的 decode 标志是任意的，不参与投票。</p>
+              </li>
+              <li>
+                <h4>活跃副本全是 prefill 才继续</h4>
+                <p>任何一个真实的 decode 副本直接否决整组。混合 prefill / decode 的那一步，所有副本都走原路径。</p>
+              </li>
+              <li>
+                <h4>阈值取活跃副本的最大行数</h4>
+                <p><code>max(counts[active]) &gt;= flashcomm1_min_prefill_tokens</code>。用复制过的 metadata 判定，所以每个 rank 算出同一个结论。</p>
+              </li>
+              <li>
+                <h4>空闲副本照样参与集合通信</h4>
+                <p>它们不参与投票，但一旦整组通过，它们仍要进 EP 的 gather / reduce-scatter，否则集合通信挂住。<code>ep_apply_local</code> 对 0 有效行的副本直接返回全零。</p>
+              </li>
+            </ul>
           </section>
 
           <section class="section wide" id="enable">
-            <span class="section-number">04</span>
-            <h2>启用方式与约束</h2>
+            <span class="section-number">06</span>
+            <h2>启用方式与参数</h2>
 
-            <p>核心收益（序列分片 + reduce_scatter）一个开关就够：</p>
+            <p>核心收益一个开关就够：</p>
             <pre><code>--enable_flashcomm1=true</code></pre>
 
-            <p>MMRS 是在此基础上的可选增量，只在 <code>enable_flashcomm1=true</code> 时才被读取：</p>
+            <p>MMRS 融合是 C++ 线上的可选增量，只在 <code>enable_flashcomm1=true</code> 时才被读取：</p>
             <pre><code>--enable_flashcomm1=true \
 --enable_mmrs_fusion=true</code></pre>
 
             <div class="table-wrap">
               <table>
-                <thead><tr><th>参数</th><th>默认值</th><th>说明</th></tr></thead>
+                <thead><tr><th>gflag</th><th>默认值</th><th>作用范围</th><th>说明</th></tr></thead>
                 <tbody>
-                  <tr><td><code>enable_flashcomm1</code></td><td><code>false</code></td><td>总开关</td></tr>
-                  <tr><td><code>enable_mmrs_fusion</code></td><td><code>false</code></td><td>Matmul + ReduceScatter 融合算子。默认关闭，因为融合内核在部分 shape 上仍可能失败</td></tr>
-                  <tr><td><code>flashcomm1_min_prefill_tokens</code></td><td><code>8192</code></td><td>prefill token 数达到该阈值才允许启用</td></tr>
-                  <tr><td><code>mmrs_comm_mode</code></td><td><code>aiv</code></td><td>torch_npu MMRS 通信模式，可选 <code>aiv</code> / <code>ai_cpu</code> / <code>none</code></td></tr>
+                  <tr><td><code>enable_flashcomm1</code></td><td><code>false</code></td><td>两条线</td><td>总开关</td></tr>
+                  <tr><td><code>flashcomm1_min_prefill_tokens</code></td><td><code>8192</code></td><td>两条线</td><td>prefill token 数达到该值才允许启用</td></tr>
+                  <tr><td><code>enable_mmrs_fusion</code></td><td><code>false</code></td><td><b>仅 C++ 线</b></td><td>Matmul + ReduceScatter 融合算子。默认关闭，因为融合内核在部分 shape 上会失败</td></tr>
+                  <tr><td><code>mmrs_comm_mode</code></td><td><code>aiv</code></td><td><b>仅 C++ 线</b></td><td>torch_npu MMRS 的通信模式：<code>aiv</code> / <code>ai_cpu</code> / <code>none</code></td></tr>
                 </tbody>
               </table>
             </div>
 
-            <p>开关打开后，还要同时满足运行条件才会真正生效：</p>
-            <ul>
-              <li>NPU 后端</li>
-              <li>处于 prefill 阶段</li>
-              <li><code>cp_size = 1</code></li>
-              <li>token 数达到阈值</li>
-              <li>TP group 可用</li>
-            </ul>
-            <p>任一条不满足就走原有执行路径，不报错。</p>
+            <p>
+              Python 线没有 MMRS 路径，走的是普通 <code>distributed.reduce_scatter</code>。
+              给 V4.1 传 <code>--enable_mmrs_fusion</code> 不会报错，也不会有任何效果。
+            </p>
 
             <div class="callout callout-warn">
-              <span class="callout-label">阈值要按模型调</span>
-              <code>flashcomm1_min_prefill_tokens</code> 的最优值与模型参数量相关，不同模型的收益拐点不同。
-              默认的 8192 是一个偏保守的通用起点，不是推荐值。建议在各模型的部署文档里给经过验证的配置。
+              <span class="callout-label">阈值要按模型和 TP 调，8192 不是推荐值</span>
+              收益拐点同时取决于模型规模、TP 大小和 padding 占比。
+              默认 8192 是一个偏保守的通用起点。
+              各模型的部署脚本应该给经过实测的值，而不是沿用默认。
             </div>
+
+            <h3>量化 MMRS 的一个实现细节</h3>
+            <p>
+              C++ 线的量化 MMRS 是异步下发的，融合算子返回后它的输入张量还不能释放。
+              <code>retain_quantized_mmrs_launch_tensors</code> 把 activation、activation scale、weight scale 存起来，
+              累计超过 <code>512 MB</code> 时做一次 <code>torch::npu::synchronize()</code> 清空；
+              最外层 <code>FlashComm1ContextScope</code> 析构时也会清一次。
+              <strong>这是显存与同步次数之间的取舍</strong>：阈值调小会更省显存但同步更频繁。
+            </p>
           </section>
 
           <section class="section wide" id="numbers">
-            <span class="section-number">05</span>
+            <span class="section-number">07</span>
             <h2>收益与验证强度</h2>
 
             <div class="callout callout-info">
-              <span class="callout-label">测试条件</span>
+              <span class="callout-label">测试条件（只对 C++ 线成立）</span>
               DeepSeek-V4-Flash W8A8C16 · Atlas A3 · EP16 / DP4 / TP4 · 输入 8K · 并发 32。
               <strong>换任何一项条件，下面的数字都不成立。</strong>
             </div>
@@ -250,32 +511,65 @@
                 <thead><tr><th>配置</th><th class="num">TTFT</th><th class="num">相对 baseline</th></tr></thead>
                 <tbody>
                   <tr><td>Baseline</td><td class="num">10211.2 ms</td><td class="num">—</td></tr>
-                  <tr><td>FlashComm（序列分片）</td><td class="num">—</td><td class="num">约 −11.8%</td></tr>
-                  <tr><td>FlashComm + MMRS</td><td class="num">8840.9 ms</td><td class="num"><b>约 −13.4%</b></td></tr>
+                  <tr><td>FlashComm1（序列分片）</td><td class="num">—</td><td class="num">约 −11.8%</td></tr>
+                  <tr><td>FlashComm1 + MMRS</td><td class="num">8840.9 ms</td><td class="num"><b>约 −13.4%</b></td></tr>
                 </tbody>
               </table>
             </div>
 
             <p>
-              也就是说：<strong>序列分片贡献约 −11.8%，MMRS 再额外贡献约 −1.8%</strong>。
-              核心能力不依赖 MMRS，这也是 MMRS 默认关闭不影响主收益的原因。
+              拆开看：<strong>序列分片贡献约 −11.8%，MMRS 再额外贡献约 −1.8%</strong>。
+              核心收益不依赖 MMRS —— 这也是 MMRS 默认关闭不影响主收益的原因。
             </p>
 
             <h3>验证强度</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>结论</th><th>强度</th><th>说明</th></tr></thead>
+                <tbody>
+                  <tr><td>C++ 线在上述单一条件下的 TTFT 收益</td><td><b>已实测</b></td><td>一组条件、未做多轮重复，不给误差区间</td></tr>
+                  <tr><td>Python V4.1 线的收益</td><td><b>未验证</b></td><td>#686 刚合入（2026-11-05）。<strong>本页不给 V4.1 的数字</strong>：C++ 线的 −13.4% 是另一代模型 + 另一套切分载体，口径不能平移</td></tr>
+                  <tr><td>其他模型 / shape / 并发的拐点</td><td><b>未验证</b></td><td>阈值的最优值随模型变化，需各自实测</td></tr>
+                  <tr><td>MMRS 在未覆盖 shape 上的稳定性</td><td><b>未验证</b></td><td>已知会在部分 shape 上失败，这是它默认关闭的原因</td></tr>
+                  <tr><td>TPOT 收益</td><td><b>不应宣称</b></td><td>FlashComm1 不介入 decode 循环</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3>想自己测的话</h3>
+            <p>最小可信的一组对照：</p>
             <ul>
-              <li><strong>已实测</strong>：上面这一组条件下的 TTFT。</li>
-              <li><strong>未验证</strong>：其他模型、其他 shape、其他并发下的收益拐点；MMRS 在未覆盖 shape 上的稳定性。</li>
-              <li><strong>不应宣称</strong>：TPOT 收益。FlashComm 不介入 decode 循环。</li>
+              <li>只翻 <code>enable_flashcomm1</code> 一个开关，其余参数与二进制完全相同；</li>
+              <li>两边都确认日志：开的那边有 <code>FLASHCOMM1_ACTIVE</code>（Python 线）且<strong>没有</strong> <code>V4.1 FlashComm1 disabled</code>；</li>
+              <li>输入长度要明显高于阈值，否则测的是"没触发"；</li>
+              <li>看 TTFT 分布而不是单次值，冷启动至少 2 轮；</li>
+              <li>精度侧：切分本身是数值等价的变换，但通信顺序和 reduce 顺序会变，浮点累加次序随之变化，所以上生产前要做一次精度对齐。</li>
             </ul>
           </section>
 
           <section class="section" id="risk">
-            <span class="section-number">06</span>
+            <span class="section-number">08</span>
             <h2>风险与待确认</h2>
             <ul>
-              <li>MMRS 融合内核在部分 shape 上会失败，这是它默认关闭的原因；开启前需要在目标 shape 上先验证。</li>
-              <li>Python 路径的 DeepSeek-V4.1 不受这个开关影响（见<a href="#tldr">第 1 节</a>）。如果在 V4.1 上看到了差异，原因不在 FlashComm。</li>
-              <li>短输入场景下，切分、gather 和调度开销可能抵消收益。阈值机制只是保底，不代表过了阈值就一定赚。</li>
+              <li>
+                <strong>静默回退很难发现。</strong> 两条线都是"不满足就走原路径"，不报错。
+                开了之后一定要用日志确认真的生效，否则会把"没触发"误读成"没收益"。
+              </li>
+              <li>
+                <strong>V4.1 上与 DSA CP 互斥。</strong> 见<a href="#gate">第 5 节</a>。两个开关都传的部署，FlashComm1 没在跑。
+              </li>
+              <li>
+                <strong>Python 线的收益还没有绑定条件的实测。</strong> 代码在仓里（#686），机制可读，但我们没有在当前配置上做过 A/B。这一页因此不给 V4.1 的数字。
+              </li>
+              <li>
+                <strong>MMRS 融合内核在部分 shape 上会失败。</strong> 开启前要在目标 shape 上先验证；CP 开着时它会被强制关掉。
+              </li>
+              <li>
+                <strong>短输入可能为负。</strong> 补齐到 <code>TP × 16</code> 的开销、两次 gather 的开销，在短序列上可能吃掉收益。阈值只是保底，过了阈值不代表一定赚。
+              </li>
+              <li>
+                <strong>待确认</strong>：Python 线在 chunked prefill 下，各 chunk 的行数差异对 EP 变长分发的 padding 重排有多大开销；这段代码（<code>ep_reduce_scatter</code> 的 <code>variable</code> 分支）会做一次逐 rank 的拷贝重排，成本未测。
+              </li>
             </ul>
           </section>
 
@@ -289,9 +583,11 @@
           <p>本页目录</p>
           <ol>
             <li><a href="#tldr">结论与适用条件</a></li>
-            <li><a href="#mechanism">机制</a></li>
+            <li><a href="#why">机制</a></li>
+            <li><a href="#boundary">层内边界</a></li>
             <li><a href="#evidence">代码证据</a></li>
-            <li><a href="#enable">启用与约束</a></li>
+            <li><a href="#gate">准入门禁</a></li>
+            <li><a href="#enable">启用与参数</a></li>
             <li><a href="#numbers">收益与验证强度</a></li>
             <li><a href="#risk">风险与待确认</a></li>
           </ol>
@@ -302,7 +598,7 @@
     <footer class="site-footer">
       <div class="shell">
         <p><a href="../">← 回到特性列表</a></p>
-        <p>分析基线：xLLM-AI/xllm main。性能数字只在本页标注的测试条件下成立。</p>
+        <p>分析基线：xLLM-AI/xllm main @ 543a1d2c8（2026-11-06）。性能数字只在本页标注的测试条件下成立。</p>
       </div>
     </footer>
   </body>

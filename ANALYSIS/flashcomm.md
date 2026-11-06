@@ -1,81 +1,76 @@
-# FlashComm 代码理解与页面口径
+# FlashComm1 页 口径（2026-11-06 重写）
 
-分析基线：`xLLM-AI/xllm` main，FlashComm for DeepSeek V4 对应 PR #2022 / commit `9549ee93`。
+分析基线：xLLM-AI/xllm main @ `543a1d2c8`。上一版页面写于 2026-10 下旬，结论已部分过期，这次从代码重写。
 
-## 系统级链路
+## 最重要的一条修正
 
-请求文本 → Tokenizer → Scheduler/Batch → Worker/Executor → DeepSeek V4 Model Forward → Embedding → Decoder Layers → Final Gather → HC Head / Norm → LM Head / Logits → Sampler → Token ID → Incremental Decoder → 流式文字。
+上一版页面断言「Python 路径的 DeepSeek-V4.1 给 `--enable_flashcomm1` 不生效」，依据是当时建立
+`FlashComm1ContextScope` 的只有 `models/llm/deepseek_v4.h` 和 `qwen3_next_hybrid_base.h` 两处。
 
-FlashComm 只介入长输入的 Prefill Model Forward。它缩短首轮 prompt 计算，因此影响 TTFT；采样后的 Decode 循环不启用 FlashComm，因此不应宣称直接降低 TPOT。
+**这条结论在 2026-11-05 之后不再成立。** `#686 feat: swa bounded replay & fc1 support.` 给 V4.1 加了
+一条独立的 Python 实现。页面上保留了这条修正，并写明：写于 11-05 之前的 V4.1 profile，旧结论对那次测量仍然成立。
 
-## 模型内数据流
+写页面时按 `git log --diff-filter=A` 核过首次引入时间，不是凭印象。
 
-模块：`FlashComm1Context`
+## 两条实现线是独立的
 
-- 职责：根据开关、Prefill 阶段、Token 阈值和 CP 拓扑决定是否启用；保存 TP rank、补齐后 token 数、本地 shard 大小、TP group 与 MMRS 选项。
-- 入口：`DeepseekV4ModelImpl::forward()` 构造 context，以 thread-local scope 覆盖 decoder layer 执行。
-- 数据流：完整 hidden states → `shard_sequence()` → TP-local rows → decoder layers → `gather_sequence()` → 完整 hidden states → final head。
-- 保护条件：NPU、Prefill、`enable_flashcomm1=true`、`cp_size=1`、tokens 达阈值、TP group 可用。
+同一个 gflag 名，两套代码，门禁条件完全不同。页面开头就把这件事讲清楚，否则读者会把 C++ 线的
+`−13.4%` 套到 V4.1 上。
 
-DeepSeek V4 单层边界：
+| | C++ 线 | Python 线 |
+|---|---|---|
+| 载体 | `FlashComm1Context` + thread-local scope | `SpMetadata` + `EpSpTokenLayout`，显式传参 |
+| 覆盖 | DeepSeek-V4、Qwen3-Next | DeepSeek-V4.1、Qwen3.5、Kimi-K3 |
+| MoE 侧 | 同一个 tp_group 的 gather | 走 `moe_ep` 组的 gather / reduce-scatter |
+| MMRS | 有，可选 | **没有**，`--enable_mmrs_fusion` 对它无效 |
+| CP 组合 | **支持**（CP 外、FC1 内） | 不支持 |
 
-1. Attention 前恢复完整序列。
-2. DSAttention 内 row-parallel 输出把 AllReduce 改为 ReduceScatter，输出 local shard。
-3. HC residual 区段在 local shard 上执行。
-4. MoE gate 前恢复完整序列，确保路由语义不变。
-5. MoE 输出后按序列重新 local slice，进入下一层。
+## C++ 线新增的 CP 组合（页面第 5 节）
 
-## 通信与算子
+`FlashComm1TokenGeometry` 把原来混用的一个 token 数拆成三个。关键设计点，页面照写：
 
-- Baseline：local Matmul partial → TP AllReduce → 每个 TP rank 都持有 `[S, H]`。
-- FlashComm core：local Matmul partial → TP ReduceScatter → 每个 rank 持有 `[S/TP, H]`。
-- Optional MMRS：把 Matmul + ReduceScatter 融合为 `npu_mm_reduce_scatter_base`；BF16 和 w8a8_dynamic 已接入。
-- Fallback：MMRS 的 dtype、shape、bias 或运行条件不满足时，退回普通 Matmul + ReduceScatter，FlashComm 核心语义仍成立。
-- Padding：全局 token 数向上补齐到 `TP × 16` 的倍数，保证各 rank collective 等长；最终 gather 后截回真实 token 数。
+- 阈值判定用 `global_num_tokens`（CP 切分前），所以 CP 组内每个 rank 得到同一个开关决策；
+- 几何用 `local_num_tokens`（CP 切分后），它成为 `ctx.original_num_tokens`；
+- 组合门槛是 `min_local_num_tokens >= tp_world_size * 16`。原因：V4 的 CP 按序列连续切，段长不均，
+  短 batch 会让高 cp_rank 只剩很少或 0 行。每个 rank 都能从全局 `q_seq_lens` 自己推出这个最小值，
+  不需要通信，所以用它做门槛能保证整组要么全开要么全关。
 
-## 收益闭环
+CP 开着时 MMRS 被强制关掉（`enable_mmrs_fusion && !cp_active`），页面写了原因与「等测过再开」的建议。
 
-AllReduce 复制完整序列 → 多个 TP rank 重复处理相同 token → 长 Prefill 的通信和可分片计算成本偏高 → ReduceScatter 在归并时直接完成序列分片 → 安全区段每 rank 只保留/处理约 `S/TP` rows → Prompt forward 更早结束 → LM Head 和采样更早得到首 token → 用户更早看到第一个文字。
+## Python 线的三层门禁（页面第 5 节）
 
-参考数据：DeepSeek-V4-Flash W8A8C16，A3，EP16 / DP4 / TP4，8K input，并发 32：TTFT 10211.2 ms → 8840.9 ms（约 -13.4%）。其中序列分片约贡献 -11.8%，MMRS 额外约 -1.8%。该数据只在相同测试条件下成立。
+1. **启动期** `_validate_flashcomm1`：昇腾 W8A8、TP>1、CP=1、**DSA CP 关**、MoE TP=1、
+   EP=DP×TP 且 DP-major rank 排布、全 MoE 层、阈值≥2。任一不满足就把开关置 False 并打 warning。
+2. **拓扑与运行**：ACL 图 / `execution_state` / `is_spec_verify` 一律不走。
+3. **每步 DP 投票**：活跃副本（`raw_counts > 0`）全是 prefill 才继续；一个真实 decode 副本否决整组；
+   阈值取活跃副本的最大行数。空闲副本不投票但仍参与 EP 集合通信。
 
-## 主要代码证据
+## 页面上特地点名的部署坑
 
-- `xllm/core/common/flash_comm1_context.{h,cpp}`：启用门槛、padding、shard/gather/reduce-scatter。
-- `xllm/models/llm/deepseek_v4.h`：模型级 context、首尾 shard/gather、final head 边界。
-- `xllm/core/layers/deepseek_v4_decoder_layer.cpp`：Attention / MoE 完整序列边界。
-- `xllm/core/layers/common/linear.cpp`：row-parallel reduce mode、BF16 / W8A8 dynamic MMRS 与 fallback。
-- `xllm/core/runtime/llm_worker_impl.cpp`：model forward → logits → sampler。
-- `xllm/core/framework/request/incremental_decoder.cpp`：token ID → 增量文字。
+**`enable_dsa_cp` 与 `enable_flashcomm1` 在 V4.1 上互斥。** 两个都传 true 时 FlashComm1 被静默关掉。
+这条同时写进了 dsa-cp 页（新增一个红色 callout）和首页 dsa-cp 卡片的脚注，因为我们自己的对齐配置里
+两个开关都在。启动日志判据：`V4.1 FlashComm1 disabled`。
 
 ## 页面表达边界
 
-- 使用“减少重复 token work / 中间激活复制”，不表述为所有算力严格下降到 `1/TP`。
-- 使用“TTFT 参考结果”，不泛化为所有模型、shape 或 workload 的固定收益。
-- 明确 MMRS 是可选增量且默认关闭，FlashComm 核心能力不依赖 MMRS。
-- 区分 decoder 末尾的 token-layout gather 与 LM Head 的词表并行 logits 归并。
+- C++ 线的 TTFT 数字（10211.2 → 8840.9 ms，−13.4%；其中序列分片 −11.8%、MMRS 再 −1.8%）照写，
+  并把测试条件放在数字正上方的 callout 里。
+- **Python V4.1 线不给任何数字**：#686 刚合入，我们没有绑定条件的 A/B。页面在「验证强度」表里把它
+  明确列为「未验证」，并说明为什么不能平移 C++ 线的数字。
+- 不声称 TPOT 收益。
+- 加了「想自己测的话」一节，给可操作的对照方法和日志判据 —— 因为这个特性的失败模式是静默回退，
+  不给判据读者会把「没触发」读成「没收益」。
 
-## 补充：当前仓里哪些模型真的受这个开关影响（2026-11 复核）
+## 写进页面的实现细节
 
-FlashComm 的上下文由模型 forward 用 `FlashComm1ContextScope` 建立。全仓建立该 scope 的只有两处：
+- `kFc1LocalTokenAlignment = 16`，对齐到 `tp_world_size × 16`。
+- `sp_row_parallel_projection` 的顺序是 matmul → reduce_scatter → **加 bias**。bias 在归并前加会变成 TP 倍。
+- 量化 MMRS 的张量生命周期：`retain_quantized_mmrs_launch_tensors` 累计到 512 MB 才同步一次，
+  最外层 scope 析构时也清一次。这是显存与同步次数的取舍。
+- `FLASHCOMM1_ACTIVE` 日志**只打一次**，只能证明激活过，不能证明稳态每步都在走。
 
-- `xllm/models/llm/deepseek_v4.h`（DeepSeek-V4，C++ 路径）
-- `xllm/models/llm/qwen3_next_hybrid_base.h`（Qwen3-Next）
+## 未写进页面
 
-**Python 路径的 DeepSeek-V4.1 没有建立这个 scope**，因此给 V4.1 传 `--enable_flashcomm1` 不会生效。
-页面在「结论与适用条件」一节用黄色 callout 显式写了这一点，并在「风险与待确认」里重申：
-如果在 V4.1 上观察到差异，原因不在 FlashComm。
-
-核对方式：`grep -rn "FlashComm1ContextScope" xllm/` 看谁构造了它。
-
-## 补充：页面重做后保留与新增的内容
-
-保留：机制（AllReduce → ReduceScatter）、单层五个边界、padding 对齐到 `TP × 16`
-（常量 `kFc1LocalTokenAlignment = 16`，在 `flash_comm1_context.cpp`）、MMRS 的 fallback 语义、
-TTFT 参考数据与拆分（序列分片约 −11.8%，MMRS 额外约 −1.8%）。
-
-新增：四个运行条件的完整列表（NPU / prefill / `cp_size=1` / token 达阈值 / TP group 可用）、
-`flashcomm1_min_prefill_tokens` 默认 8192 是保守起点而非推荐值、`mmrs_comm_mode` 的取值。
-
-删除：旧页的 hero 指标条里「0 Decode 路径侵入」这类口号式表述，改为在适用条件里直接写
-「它不改 decode 路径，不要指望 TPOT 直接受益」。
+- `EpSpTokenLayout.from_token_counts` 的 `capacity_counts` / `valid_counts` 推导细节（对读者没有增量，
+  页面只给结论：每个 (dp, tp) rank 的容量是 `ceil(count / tp_size)`）。
+- Qwen3.5 / Kimi-K3 的接入差异（不在本站范围）。
